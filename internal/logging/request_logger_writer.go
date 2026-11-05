@@ -485,5 +485,13 @@ func createUnarchivedLogFile(path string) (*os.File, error) {
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
+	archived, err := OpenRequestArchive(path + ".zst")
+	if err == nil {
+		_ = archived.Close()
+		return nil, os.ErrExist
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
 	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 }

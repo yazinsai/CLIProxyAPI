@@ -9,8 +9,8 @@ remain available for recovery. Commercial mode must remain disabled.
 
 Each completed exchange produces a private `*.log.zst` file in the request log
 directory. Zstandard compression is lossless, has frame checksums, and runs with
-one encoder worker to bound compression memory. Each archive is independently
-readable. Records include the downstream request/response and upstream attempts
+one encoder worker to bound compression memory. Each record is independently
+readable, including after background compaction. Records include the downstream request/response and upstream attempts
 captured by the existing backend logging paths, including websocket transcripts.
 GET requests are included. Management routes remain excluded to avoid retaining
 management credentials. Authentication headers and sensitive query parameters
@@ -59,8 +59,41 @@ python3.14 tools/request-archive/archive.py --directory /path/to/logs export REC
 
 Search is available through this CLI; this change adds no dashboard archive search
 screen. Existing dashboard request-log downloads continue to work. Index scans are
-linear in file count and skip already indexed immutable files. At very large
+linear in record count and skip already indexed immutable members. At very large
 volumes, date partitioning or a dedicated archive service would be appropriate.
+
+## Background compaction
+
+The `watch` command compacts completed `*.log.zst` files in batches of 100.
+Fewer than 100 standalone records remain untouched until enough accumulate.
+Compaction runs in the indexer process, outside request handling. Plaintext logs,
+active streams, temporary files, and interrupted captures are never candidates.
+The `index`, `search`, and `export` commands do not initiate compaction.
+
+Each immutable `requests-*.zip` pack stores 100 independently compressed Zstandard
+members using ZIP_STORED (no second compression pass). This reduces filesystem
+file count; it does not compress shared content across requests. Original names,
+completion timestamps at nanosecond precision, and payload digests are preserved.
+Readers open one member directly. Request-ID downloads, named error downloads,
+error listings, and quota history work across standalone and packed archives.
+CLI search keeps original record names; export accepts those same names.
+
+The packer verifies every decompressed member against the indexed SHA-256,
+fsyncs the pack, publishes it without overwriting any existing pack, and fsyncs
+the directory before unlinking sources. Compactors serialize through a local
+file lock. A restart after publication deduplicates packed/standalone records and
+finishes cleanup only after comparing their compressed bytes. Failed verification
+or publication retains sources. Temporary packs are ignored and retained after
+an abrupt process termination; they are not authoritative records.
+
+The SQLite schema adds a nullable `container` column automatically. Packs contain
+enough metadata to rebuild a deleted index. `archive_files` continues counting
+logical record members for dashboard compatibility; `storage_files` counts physical
+standalone archives plus packs, and `pack_files` counts packs. `archived_bytes`
+measures physical archive storage including ZIP metadata and any recovery duplicates.
+Deploy the updated backend readers before restarting the updated watcher. An old
+backend cannot read packed records. Keep the updated readers or unpack ZIP members
+back to their original `.log.zst` basenames before rolling back the backend.
 
 ## Local installation
 

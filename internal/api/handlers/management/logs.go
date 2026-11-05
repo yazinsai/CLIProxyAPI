@@ -215,7 +215,7 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
+	entries, err := logging.ListRequestLogFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusOK, gin.H{"files": []any{}})
@@ -233,22 +233,14 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 
 	files := make([]errorLog, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
+		name := entry.Name
 		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(strings.TrimSuffix(name, ".zst"), ".log") {
 			continue
 		}
-		info, errInfo := entry.Info()
-		if errInfo != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log info for %s: %v", name, errInfo)})
-			return
-		}
 		files = append(files, errorLog{
 			Name:     strings.TrimSuffix(name, ".zst"),
-			Size:     info.Size(),
-			Modified: info.ModTime().Unix(),
+			Size:     entry.Size,
+			Modified: entry.Modified.Unix(),
 		})
 	}
 
@@ -288,7 +280,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
+	entries, err := logging.ListRequestLogFiles(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "log directory not found"})
@@ -302,21 +294,11 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 	var matchedFile string
 	var latestModTime time.Time
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
+		name := entry.Name
 		if strings.HasSuffix(strings.TrimSuffix(name, ".zst"), suffix) {
-			info, errInfo := entry.Info()
-			if errInfo != nil {
-				if matchedFile == "" {
-					matchedFile = name
-				}
-				continue
-			}
-			if matchedFile == "" || logFileIsNewer(name, info.ModTime(), matchedFile, latestModTime) {
+			if matchedFile == "" || logFileIsNewer(name, entry.Modified, matchedFile, latestModTime) {
 				matchedFile = name
-				latestModTime = info.ModTime()
+				latestModTime = entry.Modified
 			}
 		}
 	}
@@ -335,20 +317,6 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 	prefix := dirAbs + string(os.PathSeparator)
 	if !strings.HasPrefix(fullPath, prefix) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file path"})
-		return
-	}
-
-	info, errStat := os.Stat(fullPath)
-	if errStat != nil {
-		if os.IsNotExist(errStat) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errStat)})
-		return
-	}
-	if info.IsDir() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file"})
 		return
 	}
 
@@ -471,6 +439,10 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		fullPath += ".zst"
 	}
 	info, errStat := os.Stat(fullPath)
+	if os.IsNotExist(errStat) && strings.HasSuffix(fullPath, ".zst") {
+		serveRequestLog(c, fullPath, name)
+		return
+	}
 	if errStat != nil {
 		if os.IsNotExist(errStat) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
@@ -1402,8 +1374,12 @@ func serveRequestLog(c *gin.Context, path, name string) {
 		c.FileAttachment(path, name)
 		return
 	}
-	file, err := os.Open(path)
+	file, err := logging.OpenRequestArchive(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot open request archive"})
 		return
 	}

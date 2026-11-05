@@ -4,6 +4,9 @@
 Python 3.14+. Payload files are authoritative; deleting this index loses no records.
 """
 import argparse
+from contextlib import contextmanager, ExitStack, closing
+import fcntl
+import zipfile
 from datetime import datetime, timedelta, timezone
 from compression import zstd
 import hashlib
@@ -38,46 +41,187 @@ def connect(directory):
         CREATE INDEX IF NOT EXISTS by_request ON records(request_id);
         CREATE INDEX IF NOT EXISTS by_time ON records(modified_ns);
     ''')
+    if 'container' not in {row[1] for row in db.execute('PRAGMA table_info(records)')}:
+        db.execute("ALTER TABLE records ADD COLUMN container TEXT")
+        db.commit()
     return db
+
+
+@contextmanager
+def open_member(path, name):
+    with zipfile.ZipFile(path) as pack, pack.open(name) as member:
+        yield member
+
+
+@contextmanager
+def archive_sources(directory):
+    """List immutable members without keeping every pack's file descriptor open."""
+    sources = {}
+    for pack in sorted(directory.glob('requests-*.zip')):
+        with zipfile.ZipFile(pack) as source:
+            for member in source.infolist():
+                if Path(member.filename).name != member.filename or not member.filename.endswith('.log.zst'):
+                    raise ValueError('Invalid pack member')
+                stamp = int(member.comment)
+                if member.filename in sources:
+                    raise ValueError('Duplicate packed record')
+                sources[member.filename] = (stamp, member.file_size, pack.name,
+                    lambda pack=pack, name=member.filename: open_member(pack, name))
+    for path in directory.glob('*.log.zst'):
+        if path.name in sources:
+            continue  # A published pack wins during crash recovery / source cleanup.
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue  # Another process may have just packed this record.
+        sources[path.name] = (stat.st_mtime_ns, stat.st_size, None,
+                              lambda path=path: path.open('rb'))
+    yield sources
+
+
+@contextmanager
+def open_record(directory, name):
+    # A concurrent compactor can remove a loose source after this listing.
+    for attempt in range(2):
+        with archive_sources(directory) as sources, ExitStack() as stack:
+            if name not in sources:
+                if attempt == 0:
+                    continue
+                raise FileNotFoundError(name)
+            try:
+                compressed = stack.enter_context(sources[name][3]())
+            except FileNotFoundError:
+                if attempt == 0:
+                    continue
+                raise
+            with zstd.open(compressed, 'rb') as source:
+                yield source
+            return
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def compact(db, directory, batch_size=100):
+    """Publish verified packs durably before deleting any standalone archive.
+
+    Only the background watcher calls this automatically. The lock serializes
+    compactors; request writers never wait for it and publish new immutable files.
+    """
+    if batch_size < 100:
+        raise ValueError('Compaction requires at least 100 completed requests')
+    with (directory / '.request-compaction.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        sync_directory(directory)
+        # Finish cleanup after a crash between publication and source removal.
+        with archive_sources(directory) as sources:
+            for name, (_, _, container, opener) in sources.items():
+                path = directory / name
+                if container and path.exists():
+                    with opener() as packed, path.open('rb') as loose:
+                        while True:
+                            a, b = packed.read(1024 * 1024), loose.read(1024 * 1024)
+                            if a != b:
+                                raise ValueError('Packed source differs; retained standalone archive')
+                            if not a:
+                                break
+                    path.unlink()
+        sync_directory(directory)
+        index(db, directory)
+        packed_count = 0
+        while True:
+            candidates = sorted(directory.glob('*.log.zst'))[:batch_size]
+            if len(candidates) < batch_size:
+                return packed_count
+            fd, temporary = tempfile.mkstemp(prefix='.request-pack-', dir=directory)
+            try:
+                snapshots = {}
+                with os.fdopen(fd, 'w+b') as output:
+                    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_STORED,
+                                         allowZip64=True) as pack:
+                        for path in candidates:
+                            stat = path.stat()
+                            row = db.execute('SELECT modified_ns, compressed_bytes FROM records WHERE name=?',
+                                             (path.name,)).fetchone()
+                            if row != (stat.st_mtime_ns, stat.st_size):
+                                raise ValueError('Unverified archive')
+                            snapshots[path.name] = stat
+                            member = zipfile.ZipInfo(path.name)
+                            member.comment = str(stat.st_mtime_ns).encode('ascii')
+                            member.external_attr = 0o100600 << 16
+                            with path.open('rb') as source, pack.open(member, 'w', force_zip64=True) as target:
+                                shutil.copyfileobj(source, target, 1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+                # Validate every copied payload against the verified index before publication.
+                with zipfile.ZipFile(temporary) as pack:
+                    for member in pack.infolist():
+                        digest = hashlib.sha256()
+                        with pack.open(member) as compressed, zstd.open(compressed, 'rb') as source:
+                            while chunk := source.read(1024 * 1024):
+                                digest.update(chunk)
+                        expected = db.execute('SELECT sha256 FROM records WHERE name=?',
+                                              (member.filename,)).fetchone()[0]
+                        if digest.hexdigest() != expected:
+                            raise ValueError('Pack verification failed')
+                destination = directory / ('requests-' + Path(temporary).name.removeprefix('.request-pack-') + '.zip')
+                os.link(temporary, destination)
+                sync_directory(directory)
+                # The files are immutable, but refuse cleanup if an external process changed one.
+                for path in candidates:
+                    before, after = snapshots[path.name], path.stat()
+                    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                        raise ValueError('Source changed after packing; retained source')
+                    path.unlink()
+                sync_directory(directory)
+                index(db, directory)
+                packed_count += len(candidates)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
 
 
 def index(db, directory):
     added = 0
     failures = []
-    for path in directory.glob('*.log.zst'):
-        stat = path.stat()
-        old = db.execute('SELECT modified_ns, compressed_bytes FROM records WHERE name=?',
-                         (path.name,)).fetchone()
-        if old == (stat.st_mtime_ns, stat.st_size):
-            continue
-        digest = hashlib.sha256()
-        size = 0
-        header = b''
-        # Read the complete record to validate the frame checksum and hash every byte.
-        try:
-            with zstd.open(path, 'rb') as source:
-                while chunk := source.read(1024 * 1024):
-                    digest.update(chunk)
-                    size += len(chunk)
-                    if len(header) < 16384:
-                        header += chunk[:16384 - len(header)]
-        except Exception as error:
-            # A damaged file must not prevent newer intact records being indexed.
-            failures.append(error)
-            continue
-        fields = {}
-        # Only parse request metadata before body data, never treat body text as metadata.
-        info = header.split(b'=== HEADERS ===', 1)[0]
-        for key in ('Method', 'URL', 'Timestamp'):
-            match = re.search(rb'^' + key.encode() + rb': (.*)$', info, re.MULTILINE)
-            fields[key] = match[1].decode('utf-8', 'replace') if match else None
-        name = path.name.removesuffix('.zst').removesuffix('.log')
-        request_id = name.rsplit('-', 1)[-1]
-        with db:
-            db.execute('INSERT OR REPLACE INTO records VALUES (?,?,?,?,?,?,?,?,?)',
-                       (path.name, request_id, stat.st_mtime_ns, stat.st_size, size,
-                        digest.hexdigest(), fields['Method'], fields['URL'], fields['Timestamp']))
-        added += 1
+    with archive_sources(directory) as sources:
+        for name, (modified_ns, compressed_bytes, container, opener) in sources.items():
+            old = db.execute('SELECT modified_ns, compressed_bytes, container FROM records WHERE name=?',
+                             (name,)).fetchone()
+            if old == (modified_ns, compressed_bytes, container):
+                continue
+            digest = hashlib.sha256()
+            size = 0
+            header = b''
+            # Read the complete record to validate the frame checksum and hash every byte.
+            try:
+                with opener() as compressed, zstd.open(compressed, 'rb') as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        if len(header) < 16384:
+                            header += chunk[:16384 - len(header)]
+            except Exception as error:
+                # A damaged file must not prevent newer intact records being indexed.
+                failures.append(error)
+                continue
+            fields = {}
+            # Only parse request metadata before body data, never treat body text as metadata.
+            info = header.split(b'=== HEADERS ===', 1)[0]
+            for key in ('Method', 'URL', 'Timestamp'):
+                match = re.search(rb'^' + key.encode() + rb': (.*)$', info, re.MULTILINE)
+                fields[key] = match[1].decode('utf-8', 'replace') if match else None
+            request_id = name.removesuffix('.zst').removesuffix('.log').rsplit('-', 1)[-1]
+            with db:
+                db.execute('INSERT OR REPLACE INTO records VALUES (?,?,?,?,?,?,?,?,?,?)',
+                           (name, request_id, modified_ns, compressed_bytes, size,
+                            digest.hexdigest(), fields['Method'], fields['URL'], fields['Timestamp'], container))
+            added += 1
     if failures:
         raise failures[0]
     return added
@@ -94,7 +238,9 @@ def publish_stats(db, directory, error=None, now=None):
         FROM records WHERE modified_ns >= ? GROUP BY 1""",
         (int(datetime.combine(first_day, datetime.min.time(), timezone.utc).timestamp() * 1e9),)).fetchall()
     daily = dict(rows)
-    files = list(directory.glob('*.log.zst'))
+    files = list(directory.glob('*.log.zst')) + list(directory.glob('requests-*.zip'))
+    with archive_sources(directory) as sources:
+        sources = dict(sources)
     disk = shutil.disk_usage(directory)
     index_bytes = sum(p.stat().st_size for p in directory.glob('request-index.sqlite3*') if p.is_file())
     latest = lambda value: datetime.fromtimestamp(value / 1e9, timezone.utc).isoformat() if value else None
@@ -105,8 +251,10 @@ def publish_stats(db, directory, error=None, now=None):
         # Error type only: filenames or exception text can contain private data.
         'error_kind': type(error).__name__ if error else None,
         'records': totals[0],
-        'archive_files': len(files),
-        'archived_bytes': totals[1],
+        'archive_files': len(sources),
+        'storage_files': len(files),
+        'pack_files': sum(p.suffix == '.zip' for p in files),
+        'archived_bytes': sum(p.stat().st_size for p in files),
         'original_bytes': totals[2],
         'index_bytes': index_bytes,
         'oldest_at': latest(totals[3]),
@@ -152,17 +300,18 @@ def main():
         if Path(args.name).name != args.name or not args.name.endswith('.log.zst'):
             parser.error('Expected an archive basename ending in .log.zst')
         # Exclusive creation prevents accidentally replacing an existing file.
-        with zstd.open(directory / args.name, 'rb') as source, args.output.open('xb') as target:
+        with open_record(directory, args.name) as source, args.output.open('xb') as target:
             while chunk := source.read(1024 * 1024):
                 target.write(chunk)
             target.flush()
             os.fsync(target.fileno())
         return
-    with connect(directory) as db:
+    with closing(connect(directory)) as db:
         if args.command == 'watch':
             while True:
                 try:
                     index(db, directory)
+                    compact(db, directory)
                     publish_stats(db, directory)
                 except Exception as error:
                     print(f'Archive indexing failed: {type(error).__name__}; will retry', file=sys.stderr, flush=True)

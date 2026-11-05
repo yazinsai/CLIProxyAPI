@@ -246,7 +246,7 @@ func (cache *quotaHistoryCache) load(dir string, since time.Time) []quotaHistory
 	if dir == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(dir)
+	entries, err := logging.ListRequestLogFiles(dir)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.WithError(err).Warn("quota history: failed to read log directory")
@@ -269,25 +269,21 @@ func (cache *quotaHistoryCache) load(dir string, since time.Time) []quotaHistory
 	present := make(map[string]struct{}, len(entries))
 	var keep []string
 	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".log.zst") {
-			continue
-		}
-		info, errInfo := entry.Info()
-		if errInfo != nil {
+		name := entry.Name
+		if !strings.HasSuffix(name, ".log.zst") {
 			continue
 		}
 		present[name] = struct{}{}
 		// A record's mtime is when the request finished, so nothing in an older
 		// file can fall inside the requested span.
-		if info.ModTime().Before(since) {
+		if entry.Modified.Before(since) {
 			continue
 		}
 		keep = append(keep, name)
-		if cached, ok := cache.files[name]; ok && cached.modNs == info.ModTime().UnixNano() && cached.size == info.Size() {
+		if cached, ok := cache.files[name]; ok && cached.modNs == entry.Modified.UnixNano() && cached.size == entry.Size {
 			continue
 		}
-		todo = append(todo, pending{name, info.ModTime().UnixNano(), info.Size()})
+		todo = append(todo, pending{name, entry.Modified.UnixNano(), entry.Size})
 	}
 	for name := range cache.files {
 		if _, ok := present[name]; !ok {
@@ -336,7 +332,7 @@ func (cache *quotaHistoryCache) load(dir string, since time.Time) []quotaHistory
 }
 
 func parseQuotaHistoryFile(path string) ([]quotaHistorySample, error) {
-	file, err := os.Open(path)
+	file, err := logging.OpenRequestArchive(path)
 	if err != nil {
 		return nil, err
 	}

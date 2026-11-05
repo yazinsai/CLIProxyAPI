@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -172,6 +173,22 @@ func TestGetQuotaHistoryReadsArchive(t *testing.T) {
 	}
 	if recorder.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("history response can be cached")
+	}
+
+	// Compaction must preserve both cached observations and a fresh cache rebuild.
+	packArchiveFixture(t, recent, old)
+	for _, handler := range []*Handler{h, {cfg: &config.Config{}, logDir: dir}} {
+		packedRec := httptest.NewRecorder()
+		packedCtx, _ := gin.CreateTestContext(packedRec)
+		packedCtx.Request = ctx.Request.Clone(ctx.Request.Context())
+		handler.GetQuotaHistory(packedCtx)
+		var packedResponse quotaHistoryResponse
+		if err = json.Unmarshal(packedRec.Body.Bytes(), &packedResponse); err != nil {
+			t.Fatal(err)
+		}
+		if packedRec.Code != http.StatusOK || !reflect.DeepEqual(packedResponse.Credentials, response.Credentials) || !reflect.DeepEqual(packedResponse.OldestAt, response.OldestAt) {
+			t.Fatalf("compaction changed quota history: %s", packedRec.Body.String())
+		}
 	}
 
 	bad := httptest.NewRecorder()
