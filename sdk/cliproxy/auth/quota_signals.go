@@ -88,6 +88,13 @@ func applyCooldownFields(dst *QuotaState, cooldown QuotaState) {
 	dst.BackoffLevel = cooldown.BackoffLevel
 }
 
+// CollectQuotaSignals returns the bounded quota signals a response carrying
+// headers would record for provider, using the same filtering as live
+// observation. It is used to read quota history back from archived responses.
+func CollectQuotaSignals(provider string, headers http.Header) map[string]string {
+	return collectQuotaSignals(provider, headers)
+}
+
 // collectQuotaSignals builds the bounded snapshot for a single response.
 func collectQuotaSignals(provider string, headers http.Header) map[string]string {
 	if len(headers) == 0 {
