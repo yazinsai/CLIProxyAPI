@@ -91,3 +91,34 @@ Run backend logging, middleware, and management tests plus the normal Go build.
 `python3.14 -m unittest discover -s tools/request-archive -p 'test_*.py'` tests the index.
 An isolated live HTTP smoke test also verified full response retention, authorization
 masking, and archived downloads through `/v8/management/observability/logs/requests/:id`.
+
+
+## Dashboard metadata and upstream updates
+
+`GET /v8/management/observability/archive` is authenticated by the existing v8
+management middleware. The indexer atomically publishes a bounded metadata snapshot
+in `request-archive-stats.json`. The endpoint reports recorder configuration,
+process-scoped finalization failures, and indexer statistics without reading
+payloads or adding a SQLite runtime dependency. A snapshot older than one minute
+is stale; an idle archive with a fresh snapshot is healthy. Counts and compressed
+byte totals are from verified indexed files. UTC daily counts cover seven days.
+
+The dashboard shows these metrics and an upstream maintenance section. Missing
+reporting on an unpatched backend is shown as unavailable, not zero retained data.
+
+Use the manual **Sync upstream** workflow to merge upstream main into an isolated
+branch, run archive regression/race tests, Python tests, and a build, then open a
+reviewable pull request. Conflicts and failed checks stop publication. The workflow
+does not auto-merge, touch local work, or replace a running service. The inherited
+upstream contribution-policy guards are disabled in this fork so they do not close
+or retarget legitimate upstream sync PRs. Archive checks remain enabled.
+
+After reviewing and merging a sync PR, pull the new source and build with
+`tools/build-archive.sh /tmp/cli-proxy-api`. This embeds the tested upstream base
+from `tools/archive-upstream-base`. Preserve the launch-agent archive environment,
+configuration, archive directory, and indexer when installing the rebuilt binary.
+Restart the proxy during an idle period. Keep the previous binary for rollback.
+The dashboard reports the running build, rather than assuming source merges are
+already deployed. Upstream's full Go suite currently has unrelated audit/media/
+heartbeat test failures; investigate upstream failures separately from the focused
+archive compatibility checks.

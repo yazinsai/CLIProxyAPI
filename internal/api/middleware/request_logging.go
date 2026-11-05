@@ -101,6 +101,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 				}
 			}
 			if errFinalize := wrapper.Finalize(c); errFinalize != nil {
+				logging.RecordRequestArchiveFailure()
 				log.WithError(errFinalize).Error("request recording failed; captured spool files retained where available")
 			}
 			if recovered != nil {

@@ -1,0 +1,28 @@
+name: Archive regression checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Verify archive and index contracts
+        run: |
+          go test ./internal/logging ./internal/api/middleware ./internal/api/handlers/management -run 'Archive|StreamingLogDoesNotDrop'
+          go test -race ./internal/logging ./internal/api/middleware ./internal/api/handlers/management -run 'Archive|StreamingLogDoesNotDrop'
+          python -m unittest discover -s tools/request-archive -p 'test_*.py'
+      - name: Build archive-enabled proxy
+        run: tools/build-archive.sh /tmp/cli-proxy-api

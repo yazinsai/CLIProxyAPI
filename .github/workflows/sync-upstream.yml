@@ -1,0 +1,97 @@
+name: Sync upstream
+# Deliberately manual: creates a tested PR, never merges or deploys it.
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+jobs:
+  sync:
+    if: github.repository_owner == 'yazinsai'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: router-for-me/CLIProxyAPI
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare upstream merge
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream main is already included." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Never reset an existing review branch or overwrite an open sync PR.
+          git switch -c "sync/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git merge --no-edit FETCH_HEAD
+          git rev-parse FETCH_HEAD > tools/archive-upstream-base
+          git add tools/archive-upstream-base
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record tested upstream archive baseline"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Verify merged source
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          go test ./internal/logging ./internal/api/middleware ./internal/api/handlers/management -run 'Archive|StreamingLogDoesNotDrop'
+          go test -race ./internal/logging ./internal/api/middleware ./internal/api/handlers/management -run 'Archive|StreamingLogDoesNotDrop'
+          python -m unittest discover -s tools/request-archive -p 'test_*.py'
+          tools/build-archive.sh /tmp/cli-proxy-api
+      - name: Publish tested sync PR
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git push --set-upstream origin HEAD
+          body_file="$(mktemp)"
+          cat > "$body_file" <<'BODY'
+          ## Summary
+
+          ```text
+          fork main + upstream main
+            → merged source
+            → regression checks and build
+            → this reviewable PR
+          ```
+
+          ## Evidence
+
+          - **Before:** fork main did not include the latest upstream main.
+            **After:** the merged source passed this workflow's verification step.
+          - Review the workflow run for exact commands and results. The PR does not replace the running service.
+
+          ## Merge Danger
+
+          **Door:** two-way
+
+          **Blast Radius:** proxy
+
+          Review upstream behavior changes before merging. Build and install the fork separately after merge.
+          BODY
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$(git branch --show-current)" --title 'chore: sync upstream main' --body-file "$body_file"
+      - name: Explain blocked sync
+        if: failure()
+        run: |
+          echo 'Sync stopped on a merge conflict, failed check, or GitHub permission error. No merge or deployment occurred. Inspect this run before retrying.' >> "$GITHUB_STEP_SUMMARY"
