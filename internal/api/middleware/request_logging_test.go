@@ -995,3 +995,20 @@ func TestResponseWriterLogOnErrorOnlyZeroBufferUntilActionableError(t *testing.T
 		t.Fatalf("wrapper.body.String() = %q, want %q", got, errFrame)
 	}
 }
+
+func TestArchiveCapturePreservesLargeRequestBytes(t *testing.T) {
+	t.Setenv("CLI_PROXY_REQUEST_ARCHIVE", "1")
+	body := bytes.Repeat([]byte("x"), (33 << 20))
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	info := &RequestInfo{}
+	if err := captureRequestInfoBody(ctx, info); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(info.Body, body) {
+		t.Fatal("large request was truncated")
+	}
+	if shouldSkipMethodForRequestLogging(httptest.NewRequest(http.MethodGet, "/v1/models", nil)) {
+		t.Fatal("archive skipped GET")
+	}
+}

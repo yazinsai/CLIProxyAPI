@@ -94,7 +94,7 @@ func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger
 
 // Write wraps the underlying ResponseWriter's Write method to capture response data.
 // For non-streaming responses, it writes to an internal buffer. For streaming responses,
-// it sends data chunks to a non-blocking channel for asynchronous logging.
+// it sends data chunks to a channel with backpressure for asynchronous logging.
 // CRITICAL: This method prioritizes writing to the client to ensure zero latency,
 // handling logging operations subsequently.
 func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
@@ -112,10 +112,11 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
 		}
-		// For streaming responses: Send to async logging channel (non-blocking)
-		select {
-		case w.chunkChannel <- append([]byte(nil), data...): // Non-blocking send with copy
-		default: // Channel full, skip logging to avoid blocking
+		// For streaming responses: Send to the logging channel without dropping chunks
+		if logging.RequestArchiveEnabled() {
+			w.streamWriter.WriteChunkAsync(data)
+		} else {
+			w.chunkChannel <- append([]byte(nil), data...)
 		}
 		return n, err
 	}
@@ -196,9 +197,10 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
 		}
-		select {
-		case w.chunkChannel <- []byte(data):
-		default:
+		if logging.RequestArchiveEnabled() {
+			w.streamWriter.WriteChunkAsync([]byte(data))
+		} else {
+			w.chunkChannel <- []byte(data)
 		}
 		return n, err
 	}
@@ -457,7 +459,9 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		var errMerge error
 		apiWebsocketTimeline, errMerge = mergeFileBodySource(apiWebsocketTimeline, apiWebsocketTimelineSource)
 		if errMerge != nil {
-			cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource)
+			if !logging.RequestArchiveEnabled() {
+				cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource)
+			}
 			return errMerge
 		}
 		if len(apiWebsocketTimeline) > 0 {

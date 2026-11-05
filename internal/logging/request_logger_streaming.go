@@ -83,7 +83,7 @@ type FileStreamingLogWriter struct {
 	apiResponseTimestamp time.Time
 }
 
-// WriteChunkAsync writes a response chunk asynchronously (non-blocking).
+// WriteChunkAsync queues a response chunk, applying backpressure rather than dropping data.
 //
 // Parameters:
 //   - chunk: The response chunk to write
@@ -92,16 +92,28 @@ func (w *FileStreamingLogWriter) WriteChunkAsync(chunk []byte) {
 		return
 	}
 
+	if RequestArchiveEnabled() {
+		// Archive mode persists each chunk before acknowledging it to the caller.
+		if w.responseBodyFile != nil {
+			_, errWrite := w.responseBodyFile.Write(chunk)
+			if errWrite == nil {
+				errWrite = w.responseBodyFile.Sync()
+			}
+			if errWrite != nil {
+				select {
+				case w.errorChan <- errWrite:
+				default:
+				}
+			}
+		}
+		return
+	}
 	// Make a copy of the chunk to avoid data races
 	chunkCopy := make([]byte, len(chunk))
 	copy(chunkCopy, chunk)
 
-	// Non-blocking send
-	select {
-	case w.chunkChan <- chunkCopy:
-	default:
-		// Channel is full, skip this chunk to avoid blocking
-	}
+	// Full recording requires backpressure when disk cannot keep up.
+	w.chunkChan <- chunkCopy
 }
 
 // WriteStatus buffers the response status and headers for later writing.
@@ -227,7 +239,6 @@ func (w *FileStreamingLogWriter) Close() error {
 
 	select {
 	case errWrite := <-w.errorChan:
-		w.cleanupTempFiles()
 		return errWrite
 	default:
 	}
@@ -242,11 +253,13 @@ func (w *FileStreamingLogWriter) Close() error {
 
 	logFile, _, errOpen := createUniqueLogFile(w.logsDir, w.logFilename)
 	if errOpen != nil {
-		w.cleanupTempFiles()
 		return fmt.Errorf("failed to create log file: %w", errOpen)
 	}
 
 	writeErr := w.writeFinalLog(logFile)
+	if writeErr == nil && RequestArchiveEnabled() {
+		writeErr = logFile.Sync()
+	}
 	if errClose := logFile.Close(); errClose != nil {
 		log.WithError(errClose).Warn("failed to close request log file")
 		if writeErr == nil {
@@ -254,7 +267,13 @@ func (w *FileStreamingLogWriter) Close() error {
 		}
 	}
 
-	w.cleanupTempFiles()
+	if writeErr == nil {
+		writeErr = ArchiveRequestLog(logFile.Name())
+	}
+	// Preserve spool files on failure so an operator can recover the captured data.
+	if writeErr == nil {
+		w.cleanupTempFiles()
+	}
 	return writeErr
 }
 

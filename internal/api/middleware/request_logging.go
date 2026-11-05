@@ -101,8 +101,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 				}
 			}
 			if errFinalize := wrapper.Finalize(c); errFinalize != nil {
-				// Log error but don't interrupt the response
-				// In a real implementation, you might want to use a proper logger here
+				log.WithError(errFinalize).Error("request recording failed; captured spool files retained where available")
 			}
 			if recovered != nil {
 				panic(recovered)
@@ -192,6 +191,9 @@ func (c *deferredRequestBodyCapture) Read(payload []byte) (int, error) {
 	}
 
 	remaining := maxDeferredErrorRequestBodyBytes - c.bytesCaptured
+	if logging.RequestArchiveEnabled() {
+		remaining = math.MaxInt64 - c.bytesCaptured
+	}
 	if remaining <= 0 {
 		c.truncated = true
 		return n, errRead
@@ -380,6 +382,9 @@ func shouldSkipMethodForRequestLogging(req *http.Request) bool {
 	if req == nil {
 		return true
 	}
+	if logging.RequestArchiveEnabled() {
+		return false
+	}
 	if req.Method != http.MethodGet {
 		return false
 	}
@@ -446,9 +451,17 @@ func captureRequestInfoBody(c *gin.Context, info *RequestInfo) error {
 	}
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		if logging.RequestArchiveEnabled() {
+			info.Body = bodyBytes
+		}
 		return err
 	}
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	if logging.RequestArchiveEnabled() {
+		// Retain exact wire bytes, including encoded or large bodies, without truncation.
+		info.Body = bodyBytes
+		return nil
+	}
 	// The decoded body is bounded even when no max-request-body-bytes is configured:
 	// a small zstd body can expand to gigabytes.
 	maxBytes := c.GetInt64("maxRequestBodyBytes")

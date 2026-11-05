@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 )
 
@@ -236,7 +237,7 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
+		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(strings.TrimSuffix(name, ".zst"), ".log") {
 			continue
 		}
 		info, errInfo := entry.Info()
@@ -245,7 +246,7 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 			return
 		}
 		files = append(files, errorLog{
-			Name:     name,
+			Name:     strings.TrimSuffix(name, ".zst"),
 			Size:     info.Size(),
 			Modified: info.ModTime().Unix(),
 		})
@@ -305,7 +306,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 			continue
 		}
 		name := entry.Name()
-		if strings.HasSuffix(name, suffix) {
+		if strings.HasSuffix(strings.TrimSuffix(name, ".zst"), suffix) {
 			info, errInfo := entry.Info()
 			if errInfo != nil {
 				if matchedFile == "" {
@@ -351,7 +352,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		return
 	}
 
-	c.FileAttachment(fullPath, matchedFile)
+	serveRequestLog(c, fullPath, strings.TrimSuffix(matchedFile, ".zst"))
 }
 
 type logFileMeta struct {
@@ -362,6 +363,7 @@ type logFileMeta struct {
 }
 
 func parseLogMetadata(filename string) logFileMeta {
+	filename = strings.TrimSuffix(filename, ".zst")
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
 	lastHyphen := strings.LastIndex(base, "-")
@@ -465,6 +467,9 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		return
 	}
 
+	if _, errPlain := os.Stat(fullPath); os.IsNotExist(errPlain) {
+		fullPath += ".zst"
+	}
 	info, errStat := os.Stat(fullPath)
 	if errStat != nil {
 		if os.IsNotExist(errStat) {
@@ -479,7 +484,7 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		return
 	}
 
-	c.FileAttachment(fullPath, name)
+	serveRequestLog(c, fullPath, name)
 }
 
 func (h *Handler) logDirectory() string {
@@ -1389,4 +1394,26 @@ func timestampRotationOrder(name string) (int64, bool) {
 		return 0, false
 	}
 	return math.MaxInt64 - parsed.Unix(), true
+}
+
+// serveRequestLog preserves the management download contract for compressed records.
+func serveRequestLog(c *gin.Context, path, name string) {
+	if !strings.HasSuffix(path, ".zst") {
+		c.FileAttachment(path, name)
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot open request archive"})
+		return
+	}
+	defer func() { _ = file.Close() }()
+	decoder, err := zstd.NewReader(file, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot decode request archive"})
+		return
+	}
+	defer decoder.Close()
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+	c.DataFromReader(http.StatusOK, -1, "text/plain; charset=utf-8", decoder, nil)
 }

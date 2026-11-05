@@ -61,8 +61,12 @@ func (l *FileRequestLogger) LogRequestWithOptionsAndAllSources(url, method strin
 	return l.logRequestWithSources(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, websocketTimelineSource, apiRequest, apiRequestSource, apiResponse, apiResponseSource, apiWebsocketTimeline, apiWebsocketTimelineSource, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
 }
 
-func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest []byte, apiRequestSource *FileBodySource, apiResponse []byte, apiResponseSource *FileBodySource, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
-	defer cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
+func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest []byte, apiRequestSource *FileBodySource, apiResponse []byte, apiResponseSource *FileBodySource, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) (recordErr error) {
+	defer func() {
+		if recordErr == nil || !RequestArchiveEnabled() {
+			cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
+		}
+	}()
 
 	if !l.enabled && !force {
 		return nil
@@ -161,6 +165,9 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		requestTimestamp,
 		apiResponseTimestamp,
 	)
+	if writeErr == nil && RequestArchiveEnabled() {
+		writeErr = logFile.Sync()
+	}
 	if errClose := logFile.Close(); errClose != nil {
 		log.WithError(errClose).Warn("failed to close request log file")
 		if writeErr == nil {
@@ -169,6 +176,10 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 	}
 	if writeErr != nil {
 		return fmt.Errorf("failed to write log file: %w", writeErr)
+	}
+
+	if errArchive := ArchiveRequestLog(logFile.Name()); errArchive != nil {
+		return errArchive
 	}
 
 	if force && !l.enabled {
@@ -329,7 +340,7 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 	}
 
 	target := filepath.Join(dir, filename)
-	logFile, errOpen := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	logFile, errOpen := createUnarchivedLogFile(target)
 	if errOpen == nil {
 		return logFile, target, nil
 	}
@@ -340,7 +351,7 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 	for seq := 1; seq <= 1000; seq++ {
 		candidateName := fmt.Sprintf("%s_%d-%s%s", prefix, seq, idPart, ext)
 		candidatePath := filepath.Join(dir, candidateName)
-		logCandidate, errCandidate := os.OpenFile(candidatePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		logCandidate, errCandidate := createUnarchivedLogFile(candidatePath)
 		if errCandidate == nil {
 			return logCandidate, candidatePath, nil
 		}
@@ -454,9 +465,25 @@ func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error
 		_ = os.Remove(tmpPath)
 		return "", errCopy
 	}
+	if RequestArchiveEnabled() {
+		if errSync := tmpFile.Sync(); errSync != nil {
+			_ = tmpFile.Close()
+			return tmpPath, errSync
+		}
+	}
 	if errClose := tmpFile.Close(); errClose != nil {
 		_ = os.Remove(tmpPath)
 		return "", errClose
 	}
 	return tmpPath, nil
+}
+
+// createUnarchivedLogFile reserves names already used by compressed records.
+func createUnarchivedLogFile(path string) (*os.File, error) {
+	if _, err := os.Stat(path + ".zst"); err == nil {
+		return nil, os.ErrExist
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 }

@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"encoding/json"
 	"github.com/MoeForge/moego/base64"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 )
 
 func TestDecodeLogCursorRejectsUnsafeFiles(t *testing.T) {
@@ -953,5 +955,27 @@ func TestGetRequestLogByID_MatchesFullUUIDAndShortID(t *testing.T) {
 	}
 	if body := recFull.Body.String(); body != "uuid v7 request log content" {
 		t.Fatalf("body = %q, want %q", body, "uuid v7 request log content")
+	}
+}
+
+func TestGetRequestLogByIDDownloadsCompressedArchive(t *testing.T) {
+	t.Setenv("CLI_PROXY_REQUEST_ARCHIVE", "1")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v1-responses-2026-11-05T150000-12345678.log")
+	payload := []byte("complete archived request and response\n")
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := logging.ArchiveRequestLog(path); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: &config.Config{}, logDir: dir}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v8/management/observability/logs/requests/12345678", nil)
+	c.Params = gin.Params{{Key: "id", Value: "12345678"}}
+	h.GetRequestLogByID(c)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("archive download failed: status=%d", rec.Code)
 	}
 }
