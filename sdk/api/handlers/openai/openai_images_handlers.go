@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/MoeForge/moego/base64"
 	"io"
@@ -18,6 +19,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -1975,12 +1978,16 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	}
 	defer stopKeepAlive()
 
-	writeEvent := func(eventName string, dataJSON []byte) {
+	writeEvent := func(eventName string, dataJSON []byte) error {
 		if strings.TrimSpace(eventName) != "" {
-			_, _ = fmt.Fprintf(c.Writer, "event: %s\n", eventName)
+			if _, errWrite := fmt.Fprintf(c.Writer, "event: %s\n", eventName); errWrite != nil {
+				return errWrite
+			}
 		}
-		_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(dataJSON))
-		flusher.Flush()
+		if _, errWrite := fmt.Fprintf(c.Writer, "data: %s\n\n", string(dataJSON)); errWrite != nil {
+			return errWrite
+		}
+		return httpwire.FlushResponse(c.Writer)
 	}
 
 	// Peek for the first chunk/error while still allowing configured SSE heartbeats.
@@ -2042,8 +2049,13 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	}
 }
 
-func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, writeEvent func(string, []byte)) {
+func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, writeEvent func(string, []byte) error) {
 	acc := &sseFrameAccumulator{}
+	consumerCancel := cancel
+	cancel = func(err error) {
+		dashboard.ObserveDelivery(c.Request.Context(), err == nil, errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+		consumerCancel(err)
+	}
 
 	responseFormat = strings.ToLower(strings.TrimSpace(responseFormat))
 	if responseFormat == "" {
@@ -2089,7 +2101,9 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			} else {
 				_ = dataDoc.Set("b64_json", b64)
 			}
-			writeEvent(eventName, dataDoc.Bytes())
+			if errWrite := writeEvent(eventName, dataDoc.Bytes()); errWrite != nil {
+				return true, &interfaces.ErrorMessage{Error: errWrite}
+			}
 		case "response.completed":
 			results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(payload)
 			if err != nil {
@@ -2111,7 +2125,9 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 				if len(usageRaw) > 0 && json.Valid(usageRaw) {
 					_ = dataDoc.SetRawBytes("usage", usageRaw)
 				}
-				writeEvent(eventName, dataDoc.Bytes())
+				if errWrite := writeEvent(eventName, dataDoc.Bytes()); errWrite != nil {
+					return true, &interfaces.ErrorMessage{Error: errWrite}
+				}
 			}
 			return true, nil
 		}
@@ -2162,7 +2178,8 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 					cancel(errMsg.Error)
 					return
 				}
-				cancel(nil)
+				errMsg := emitError(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("upstream image stream closed before a completed image event")})
+				cancel(errMsg.Error)
 				return
 			}
 			for _, frame := range acc.AddChunk(chunk) {

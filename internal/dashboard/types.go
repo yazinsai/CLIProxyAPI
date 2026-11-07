@@ -246,9 +246,12 @@ func (t *Tracker) Complete(row Request, cancelled, writeFailed bool) Request {
 		row.Outcome = "interrupted"
 		row.Reason = "stream_interrupted"
 	}
-	if cancelled || writeFailed || t.terminalCancelled {
+	if row.StatusCode < 400 && (cancelled || writeFailed || t.terminalCancelled) {
 		row.Outcome = "interrupted"
-		row.Reason = "cancelled"
+		row.Reason = "stream_interrupted"
+		if !writeFailed && (cancelled || t.terminalCancelled) {
+			row.Reason = "cancelled"
+		}
 	}
 	if t.deliveryKnown && row.StatusCode < 400 {
 		if t.deliverySucceeded && !writeFailed {

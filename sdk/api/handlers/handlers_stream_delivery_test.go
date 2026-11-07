@@ -67,6 +67,15 @@ func TestIssue6332LifecycleDeliveryReadyBoundary(t *testing.T) {
 	}
 }
 
+func TestStreamDeliveryCompletionSurvivesDeadlineCleanup(t *testing.T) {
+	ctx, finish := coreusage.WithStreamDelivery(context.Background())
+	finish(nil)
+	outcome, status, err := streamDeliveryCompletion(ctx, pluginapi.RequestCompletionCanceled, 0, context.DeadlineExceeded)
+	if outcome != pluginapi.RequestCompletionSucceeded || status != http.StatusOK || err != nil {
+		t.Fatalf("delivered terminal lost to deadline cleanup: %s/%d/%v", outcome, status, err)
+	}
+}
+
 func TestIssue6332LifecycleClosesChannelsBeforeDeliveryWait(t *testing.T) {
 	model := "issue6332-lifecycle-eof"
 	executor := &interceptorCaptureExecutor{stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {

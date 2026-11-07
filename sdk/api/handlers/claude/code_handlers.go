@@ -23,11 +23,13 @@ import (
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -238,7 +240,13 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	deliveryCtx, finishDelivery := usage.WithStreamDelivery(context.Background())
+	defer finishDelivery(context.Canceled)
+	cliCtx, cancelExecution := h.GetContextWithCancel(h, c, deliveryCtx)
+	cliCancel := func(err error) {
+		finishDelivery(err)
+		cancelExecution(err)
+	}
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -258,8 +266,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	}
 	writeKeepAlive := func() bool {
 		commitSSE()
-		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-		flusher.Flush()
+		if _, errWrite := c.Writer.Write([]byte(": keep-alive\n\n")); errWrite != nil {
+			cliCancel(errWrite)
+			return false
+		}
+		if errFlush := httpwire.FlushResponse(c.Writer); errFlush != nil {
+			cliCancel(errFlush)
+			return false
+		}
 		return true
 	}
 	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
@@ -339,8 +353,18 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				streamState.loggedTerminalError = true
 			}
 			if len(chunk) > 0 {
-				_, _ = c.Writer.Write(chunk)
-				flusher.Flush()
+				n, errWrite := c.Writer.Write(chunk)
+				if errWrite == nil && n != len(chunk) {
+					errWrite = io.ErrShortWrite
+				}
+				if errWrite != nil {
+					cliCancel(errWrite)
+					return
+				}
+				if errFlush := httpwire.FlushResponse(c.Writer); errFlush != nil {
+					cliCancel(errFlush)
+					return
+				}
 			}
 
 			// Continue streaming the rest
@@ -491,6 +515,20 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 		state = &claudeSSEStreamState{trailingNewlines: 2}
 	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		InitiallyDone:     state.sawMessageStop && !state.sawErrorEvent && state.policyRefusalErr == nil,
+		ContinueAfterDone: func() bool { return true },
+		ChunkDone: func() bool {
+			return state.sawMessageStop && !state.sawErrorEvent && state.policyRefusalErr == nil
+		},
+		ChunkError: func() *interfaces.ErrorMessage {
+			if state.policyRefusalErr != nil {
+				return state.policyRefusalErr
+			}
+			if state.sawErrorEvent {
+				return &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("upstream Claude stream returned an error event")}
+			}
+			return nil
+		},
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return

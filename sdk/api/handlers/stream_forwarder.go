@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"golang.org/x/net/context"
 )
@@ -79,6 +81,20 @@ func PendingStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.Error
 	return nil, false
 }
 
+func streamErrorCause(msg *interfaces.ErrorMessage) error {
+	if msg == nil {
+		return nil
+	}
+	if msg.Error != nil {
+		return msg.Error
+	}
+	status := msg.StatusCode
+	if status < 400 || http.StatusText(status) == "" {
+		status = http.StatusBadGateway
+	}
+	return errors.New(http.StatusText(status))
+}
+
 type StreamForwardOptions struct {
 	// KeepAliveInterval overrides the configured streaming keep-alive interval.
 	// If nil, the configured default is used. If set to <= 0, keep-alives are disabled.
@@ -93,6 +109,13 @@ type StreamForwardOptions struct {
 
 	// ChunkDone reports successful terminal delivery after WriteChunk and Flush.
 	ChunkDone func() bool
+
+	// InitiallyDone acknowledges a terminal event already written and flushed by the caller.
+	InitiallyDone bool
+
+	// ContinueAfterDone drains producers that cannot yet stop on terminal delivery.
+	// Delivery is still acknowledged immediately, independently of execution cleanup.
+	ContinueAfterDone func() bool
 
 	// Flush optionally exposes transport flush errors hidden by http.Flusher.
 	Flush func() error
@@ -118,6 +141,41 @@ type StreamForwardOptions struct {
 	WriteKeepAlive func()
 }
 
+type streamResponseWriter struct {
+	gin.ResponseWriter
+	err error
+}
+
+func (w *streamResponseWriter) Write(body []byte) (int, error) {
+	n, errWrite := w.ResponseWriter.Write(body)
+	w.observeWrite(n, len(body), errWrite)
+	return n, errWrite
+}
+
+func (w *streamResponseWriter) WriteString(body string) (int, error) {
+	n, errWrite := w.ResponseWriter.WriteString(body)
+	w.observeWrite(n, len(body), errWrite)
+	return n, errWrite
+}
+
+func (w *streamResponseWriter) observeWrite(n, size int, errWrite error) {
+	if w.err != nil {
+		return
+	}
+	if errWrite != nil {
+		w.err = errWrite
+	} else if n != size {
+		w.err = io.ErrShortWrite
+	}
+}
+
+func (w *streamResponseWriter) FlushError() error {
+	if w.err != nil {
+		return w.err
+	}
+	return httpwire.FlushResponse(w.ResponseWriter)
+}
+
 func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, opts StreamForwardOptions) {
 	if c == nil {
 		return
@@ -125,27 +183,42 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	if cancel == nil {
 		return
 	}
+	writer := &streamResponseWriter{ResponseWriter: c.Writer}
+	c.Writer = writer
+	defer func() { c.Writer = writer.ResponseWriter }()
+	delivered := false
 	consumerCancel := cancel
 	cancel = func(err error) {
+		if delivered && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			err = nil
+		}
 		if err != nil && c.Request != nil {
 			dashboard.ObserveDelivery(c.Request.Context(), false, errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 		}
 		consumerCancel(err)
 	}
 	acknowledgeSuccess := func() {
+		delivered = true
 		if c.Request != nil {
 			dashboard.ObserveDelivery(c.Request.Context(), true, false)
 		}
 	}
 
 	flush := func() bool {
+		if writer.err != nil {
+			cancel(writer.err)
+			return false
+		}
 		if opts.Flush != nil {
 			if errFlush := opts.Flush(); errFlush != nil {
 				cancel(errFlush)
 				return false
 			}
 		} else {
-			flusher.Flush()
+			if errFlush := httpwire.FlushResponse(c.Writer); errFlush != nil {
+				cancel(errFlush)
+				return false
+			}
 		}
 		return true
 	}
@@ -168,6 +241,25 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	}
 	keepAliveC, stopKeepAlive := NewStreamingKeepAliveTicker(keepAliveInterval)
 	defer stopKeepAlive()
+	continueAfterDone := func() bool {
+		return opts.ContinueAfterDone != nil && opts.ContinueAfterDone()
+	}
+	if opts.ChunkError != nil {
+		if initialErr := opts.ChunkError(); initialErr != nil {
+			if opts.NormalizeTerminalError != nil {
+				initialErr = opts.NormalizeTerminalError(initialErr)
+			}
+			cancel(streamErrorCause(initialErr))
+			return
+		}
+	}
+	if opts.InitiallyDone {
+		acknowledgeSuccess()
+		if !continueAfterDone() {
+			cancel(nil)
+			return
+		}
+	}
 
 	var terminalErr *interfaces.ErrorMessage
 	for {
@@ -190,13 +282,21 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 					terminalErr = opts.CloseError()
 				}
 				if terminalErr != nil {
+					if delivered {
+						cancel(streamErrorCause(terminalErr))
+						return
+					}
 					if opts.WriteTerminalError != nil {
 						opts.WriteTerminalError(terminalErr)
 					}
 					if !flush() {
 						return
 					}
-					cancel(terminalErr.Error)
+					cancel(streamErrorCause(terminalErr))
+					return
+				}
+				if delivered {
+					cancel(nil)
 					return
 				}
 				if opts.WriteDone != nil {
@@ -209,6 +309,9 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				cancel(nil)
 				return
 			}
+			if delivered {
+				continue
+			}
 			writeChunk(chunk)
 			if !flush() {
 				return
@@ -220,7 +323,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 						chunkErr = opts.NormalizeTerminalError(chunkErr)
 					}
 					if chunkErr != nil {
-						cancel(chunkErr.Error)
+						cancel(streamErrorCause(chunkErr))
 					} else {
 						cancel(nil)
 					}
@@ -229,8 +332,10 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			}
 			if opts.ChunkDone != nil && opts.ChunkDone() {
 				acknowledgeSuccess()
-				cancel(nil)
-				return
+				if !continueAfterDone() {
+					cancel(nil)
+					return
+				}
 			}
 		case errMsg, ok := <-errs:
 			if !ok {
@@ -242,7 +347,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				if opts.NormalizeTerminalError != nil {
 					terminalErr = opts.NormalizeTerminalError(terminalErr)
 				}
-				if opts.WriteTerminalError != nil {
+				if opts.WriteTerminalError != nil && !delivered {
 					opts.WriteTerminalError(terminalErr)
 					if !flush() {
 						return
@@ -251,11 +356,14 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			}
 			var execErr error
 			if terminalErr != nil {
-				execErr = terminalErr.Error
+				execErr = streamErrorCause(terminalErr)
 			}
 			cancel(execErr)
 			return
 		case <-keepAliveC:
+			if delivered {
+				continue
+			}
 			writeKeepAlive()
 			if !flush() {
 				return

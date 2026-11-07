@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -191,12 +192,19 @@ func TestWebsocketTurnsHaveIndependentCompletionRowsAndFinalizeOnce(t *testing.T
 	}
 }
 
-func TestStoreSchemaTwoIgnoresFaultyTelemetryAndResetsCoverage(t *testing.T) {
+func TestStoreSchemaThreeIgnoresFaultyTelemetryAndResetsCoverage(t *testing.T) {
+	for _, schema := range []int{1, 2} {
+		t.Run(fmt.Sprint(schema), func(t *testing.T) { testStoreFaultyTelemetryMigration(t, schema) })
+	}
+}
+
+func testStoreFaultyTelemetryMigration(t *testing.T, schema int) {
+	t.Helper()
 	directory := t.TempDir()
 	old := testRow(time.Now().UTC().Add(-time.Hour), "model", "provider", "interrupted")
 	old.Reason = "cancelled"
 	doc := ojson.NewDocString("{}")
-	for key, value := range map[string]any{"schema_version": 1, "coverage_start": old.StartedAt, "request": old} {
+	for key, value := range map[string]any{"schema_version": schema, "coverage_start": old.StartedAt, "request": old} {
 		if errSet := doc.Set(key, value); errSet != nil {
 			t.Fatal(errSet)
 		}

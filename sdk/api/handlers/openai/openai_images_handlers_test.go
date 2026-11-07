@@ -597,7 +597,7 @@ func TestForwardImagesStreamCancelsWithPayloadError(t *testing.T) {
 	var canceled error
 	firstChunk := []byte("event: error\ndata: {\"error\":{\"message\":\"token=image-secret\"}}\n\n")
 
-	h.forwardImagesStream(context.Background(), c, flusher, func(err error) { canceled = err }, data, errs, firstChunk, "b64_json", "image_generation", func(string, []byte) {})
+	h.forwardImagesStream(context.Background(), c, flusher, func(err error) { canceled = err }, data, errs, firstChunk, "b64_json", "image_generation", func(string, []byte) error { return nil })
 	if canceled == nil || strings.Contains(canceled.Error(), "image-secret") || !strings.Contains(canceled.Error(), "[REDACTED]") {
 		t.Fatalf("payload error cancel = %v body=%q", canceled, recorder.Body.String())
 	}

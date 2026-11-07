@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -24,6 +25,7 @@ import (
 )
 
 type responsesWebsocketForwardOptions struct {
+	deliveryCtx              context.Context
 	preserveCompletionOutput func() bool
 	duplexStream             func() bool
 	toolCacheTurn            *responsesWebsocketToolCacheTurn
@@ -48,6 +50,19 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	var opts responsesWebsocketForwardOptions
 	if len(options) > 0 {
 		opts = options[0]
+	}
+	deliveryCtx := opts.deliveryCtx
+	if deliveryCtx == nil && c != nil && c.Request != nil {
+		deliveryCtx = c.Request.Context()
+	}
+	consumerCancel := cancel
+	cancel = func(params ...interface{}) {
+		if len(params) > 0 {
+			if err, ok := params[0].(error); ok && err != nil {
+				dashboard.ObserveDelivery(deliveryCtx, false, errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+			}
+		}
+		consumerCancel(params...)
 	}
 	toolCacheTurn := opts.toolCacheTurn
 	completed := false
@@ -343,6 +358,20 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					)
 					cancel(errWrite)
 					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
+				}
+				// A standard turn is delivered when its terminal websocket message is
+				// written, even if the client closes before upstream channels drain.
+				// Duplex streams reuse this tracker across multiple response messages.
+				if opts.duplexStream == nil || !opts.duplexStream() {
+					status := ojson.GetBytesNoCopy(payloads[i], "response.status").String()
+					if isResponsesWebsocketCompletionEvent(eventType) && !responsesSSEPayloadHasError(payloads[i]) && (status == "" || status == "completed") {
+						dashboard.ObserveDelivery(deliveryCtx, true, false)
+					} else if eventType == "response.incomplete" {
+						interrupted := ojson.GetBytesNoCopy(payloads[i], "response.incomplete_details.reason").String() == "interrupted"
+						dashboard.ObserveDelivery(deliveryCtx, false, interrupted)
+					} else if isResponsesWebsocketCompletionEvent(eventType) || eventType == "response.failed" || eventType == wsEventTypeError {
+						dashboard.ObserveDelivery(deliveryCtx, false, false)
+					}
 				}
 			}
 		}

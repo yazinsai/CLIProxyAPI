@@ -911,7 +911,7 @@ func streamDeliveryCompletion(ctx context.Context, outcome pluginapi.RequestComp
 		return outcome, status, err
 	}
 	deliveryErr, tracked := coreusage.WaitStreamDelivery(ctx)
-	if !tracked || (err != nil && !errors.Is(err, context.Canceled)) || outcome == pluginapi.RequestCompletionRejected {
+	if !tracked || (err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) || outcome == pluginapi.RequestCompletionRejected {
 		return outcome, status, err
 	}
 	if deliveryErr == nil {

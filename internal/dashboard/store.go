@@ -22,7 +22,7 @@ const (
 	maxJournalBytes = 32 << 20
 	maxLineBytes    = 32 << 10
 	retention       = 24 * time.Hour
-	journalSchema   = 2
+	journalSchema   = 3
 )
 
 type Store struct {
@@ -71,9 +71,9 @@ func (s *Store) load() {
 		scanner.Buffer(make([]byte, 4096), maxLineBytes)
 		for scanner.Scan() {
 			doc := ojson.ParseBytes(scanner.Bytes())
-			// Version 1 misclassified successful terminal delivery as cancellation.
+			// Versions 1 and 2 misclassified terminal delivery before EOF as cancellation.
 			// Do not reinterpret faulty historical telemetry; start fresh coverage.
-			if doc.Get("schema_version").Int() == 1 {
+			if version := doc.Get("schema_version").Int(); version >= 1 && version < journalSchema {
 				continue
 			}
 			if doc.Get("schema_version").Int() != journalSchema {

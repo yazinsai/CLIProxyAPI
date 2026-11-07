@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -66,6 +67,14 @@ func (w *dashboardWriter) WriteString(body string) (int, error) {
 	w.failed = w.failed || errWrite != nil
 	return n, errWrite
 }
+
+func (w *dashboardWriter) FlushError() error {
+	errFlush := httpwire.FlushResponse(w.ResponseWriter)
+	w.failed = w.failed || errFlush != nil
+	return errFlush
+}
+
+func (w *dashboardWriter) Flush() { _ = w.FlushError() }
 
 func dashboardRequest(req *http.Request) bool {
 	if req.URL == nil {

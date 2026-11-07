@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,8 +11,27 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
+
+type dashboardFlushErrorWriter struct {
+	gin.ResponseWriter
+}
+
+func (w *dashboardFlushErrorWriter) FlushError() error { return io.ErrClosedPipe }
+
+func TestDashboardWriterPreservesTransportFlushErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	w := &dashboardWriter{ResponseWriter: &dashboardFlushErrorWriter{ResponseWriter: c.Writer}}
+	if errFlush := httpwire.FlushResponse(w); !errors.Is(errFlush, io.ErrClosedPipe) {
+		t.Fatalf("flush error=%v, want closed pipe", errFlush)
+	}
+	if !w.failed {
+		t.Fatal("transport flush failure was not tracked")
+	}
+}
 
 func TestDashboardMiddlewareUsesFinalInboundStatusAndChildAttempts(t *testing.T) {
 	gin.SetMode(gin.TestMode)

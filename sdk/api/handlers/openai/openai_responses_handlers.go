@@ -1401,8 +1401,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 		if errMsg, pending := handlers.PendingStreamError(errs); pending {
 			h.logResponsesStreamError(c, framer, sanitizeResponsesStreamErrorMessage(errMsg))
 		}
-		cancel(nil)
-		return
 	}
 	writeTerminalError := func(errMsg *interfaces.ErrorMessage) {
 		framer.Flush(c.Writer)
@@ -1435,13 +1433,23 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 	}
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
-		NormalizeTerminalError: sanitizeResponsesStreamErrorMessage,
-		Flush:                  func() error { return flushResponsesSSE(c.Writer) },
+		InitiallyDone: framer.terminalEvent == "response.completed" && framer.terminalError == nil,
+		ContinueAfterDone: func() bool {
+			return framer.canComplete == nil || !framer.canComplete()
+		},
+		NormalizeTerminalError: func(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+			safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
+			if framer.terminalEvent == "response.completed" {
+				h.logResponsesStreamError(c, framer, safeErrMsg)
+			}
+			return safeErrMsg
+		},
+		Flush: func() error { return flushResponsesSSE(c.Writer) },
 		WriteChunk: func(chunk []byte) {
 			framer.WriteChunk(c.Writer, chunk)
 		},
 		ChunkDone: func() bool {
-			return framer.canComplete != nil && framer.canComplete() && framer.terminalEvent == "response.completed" && framer.writeErr == nil
+			return framer.terminalEvent == "response.completed" && framer.terminalError == nil && framer.writeErr == nil
 		},
 		ChunkError: func() *interfaces.ErrorMessage {
 			if framer.writeErr != nil {
