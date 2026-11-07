@@ -41,7 +41,7 @@ func (h *Handler) GetDashboardRequests(c *gin.Context) {
 	if !ok {
 		return
 	}
-	limit, errLimit := strconv.Atoi(c.DefaultQuery("limit", "8"))
+	limit, errLimit := strconv.Atoi(c.DefaultQuery("limit", "10"))
 	if errLimit != nil || limit < 1 || limit > 100 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be between 1 and 100"})
 		return

@@ -54,6 +54,25 @@ func WaitStreamDelivery(ctx context.Context) (error, bool) {
 	return delivery.err, true
 }
 
+// StreamDeliveryResult snapshots a resolved consumer acknowledgment without
+// waiting for producers. Acknowledged delivery can precede execution cleanup and
+// asynchronous lifecycle reporting; request observers need that exact boundary.
+func StreamDeliveryResult(ctx context.Context) (error, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	delivery, ok := ctx.Value(streamDeliveryKey{}).(*streamDelivery)
+	if !ok {
+		return nil, false
+	}
+	select {
+	case <-delivery.done:
+		return delivery.err, true
+	default:
+		return nil, false
+	}
+}
+
 // SupportStreamDelivery opts an active producer into early terminal cancellation.
 // The producer must reconcile cancellation with WaitStreamDelivery.
 func SupportStreamDelivery(ctx context.Context) func() {

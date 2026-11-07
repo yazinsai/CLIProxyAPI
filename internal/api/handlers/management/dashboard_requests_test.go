@@ -104,3 +104,18 @@ func TestDashboardRequestQueryValidationAndUnavailableStore(t *testing.T) {
 		t.Fatal("missing store became fabricated zero")
 	}
 }
+
+func TestDashboardRequestsDefaultsToLatestTen(t *testing.T) {
+	h, router, _ := dashboardTestHandler(t)
+	for range 9 {
+		completed := time.Now().UTC()
+		if errAdd := h.dashboardStore.Add(dashboard.Request{ID: uuid.NewString(), Model: "model", Provider: "provider", StartedAt: completed, CompletedAt: completed, StatusCode: 200, Outcome: "success"}); errAdd != nil {
+			t.Fatal(errAdd)
+		}
+	}
+	recorder := dashboardGet(router, "/requests?window=8h")
+	doc := ojson.ParseBytes(recorder.Body.Bytes())
+	if recorder.Code != 200 || doc.Get("requests.#").Int() != 10 || doc.Get("next_cursor").String() == "" {
+		t.Fatalf("default feed %s", recorder.Body.String())
+	}
+}

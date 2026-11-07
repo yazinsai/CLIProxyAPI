@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -659,6 +660,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = coreauth.WithCodexClientRequest(newCtx, coreauth.IsCodexClientRequest(newCtx))
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {
+		if deliveryErr, acknowledged := coreusage.StreamDeliveryResult(newCtx); acknowledged {
+			dashboard.ObserveDelivery(newCtx, deliveryErr == nil, errors.Is(deliveryErr, context.Canceled) || errors.Is(deliveryErr, context.DeadlineExceeded))
+		}
 		defer dashboard.CompleteSocket(newCtx, uuid.NewString())
 		if c != nil {
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())

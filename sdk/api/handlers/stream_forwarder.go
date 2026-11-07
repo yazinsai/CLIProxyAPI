@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"golang.org/x/net/context"
 )
@@ -123,6 +125,18 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	if cancel == nil {
 		return
 	}
+	consumerCancel := cancel
+	cancel = func(err error) {
+		if err != nil && c.Request != nil {
+			dashboard.ObserveDelivery(c.Request.Context(), false, errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+		}
+		consumerCancel(err)
+	}
+	acknowledgeSuccess := func() {
+		if c.Request != nil {
+			dashboard.ObserveDelivery(c.Request.Context(), true, false)
+		}
+	}
 
 	flush := func() bool {
 		if opts.Flush != nil {
@@ -191,6 +205,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				if !flush() {
 					return
 				}
+				acknowledgeSuccess()
 				cancel(nil)
 				return
 			}
@@ -213,6 +228,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				}
 			}
 			if opts.ChunkDone != nil && opts.ChunkDone() {
+				acknowledgeSuccess()
 				cancel(nil)
 				return
 			}

@@ -53,6 +53,9 @@ type Tracker struct {
 	terminalFailed    bool
 	terminalCancelled bool
 	terminalStatus    int
+	deliveryKnown     bool
+	deliverySucceeded bool
+	deliveryCancelled bool
 	socketRoot        bool
 	socketStarted     time.Time
 	socketTrace       string
@@ -203,6 +206,23 @@ func ObserveCompletion(ctx context.Context, model string, stream, failed, cancel
 	tracker.terminalStatus = status
 }
 
+// ObserveDelivery records the consumer's validated and flushed final outcome.
+// Provider usage success alone cannot prove that delivery reached the client.
+func ObserveDelivery(ctx context.Context, succeeded, cancelled bool) {
+	tracker := trackerFrom(ctx)
+	if tracker == nil {
+		return
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.closed || tracker.deliveryKnown {
+		return
+	}
+	tracker.deliveryKnown = true
+	tracker.deliverySucceeded = succeeded
+	tracker.deliveryCancelled = cancelled
+}
+
 func (t *Tracker) Complete(row Request, cancelled, writeFailed bool) Request {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -229,6 +249,20 @@ func (t *Tracker) Complete(row Request, cancelled, writeFailed bool) Request {
 	if cancelled || writeFailed || t.terminalCancelled {
 		row.Outcome = "interrupted"
 		row.Reason = "cancelled"
+	}
+	if t.deliveryKnown && row.StatusCode < 400 {
+		if t.deliverySucceeded && !writeFailed {
+			// Response consumers intentionally cancel execution after a delivered
+			// terminal event. That cleanup is not a failed client request.
+			row.Outcome = "success"
+			row.Reason = ""
+		} else {
+			row.Outcome = "interrupted"
+			row.Reason = "stream_interrupted"
+			if t.deliveryCancelled {
+				row.Reason = "cancelled"
+			}
+		}
 	}
 	return row
 }

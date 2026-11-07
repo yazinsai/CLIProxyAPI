@@ -152,6 +152,15 @@ or persistence encountered an error. Coverage survives idle restarts, and bounde
 journal eviction advances the coverage boundary. Request details expose an archive
 download ID only when a matching file or pack entry is present.
 
+Completion journal schema 2 records the consumer's explicit stream-delivery
+acknowledgment before execution cleanup. A validated and flushed terminal success
+remains successful when the consumer intentionally cancels the upstream reader.
+Disconnects before terminal delivery, write/flush errors, and terminal protocol
+failures remain failed or interrupted. Provider usage success alone never proves
+successful downstream delivery. Schema 1 telemetry from the initial implementation
+is ignored because it incorrectly classified normal terminal cleanup as interrupted;
+the coverage boundary resets when upgrading. Full request archives are unchanged.
+
 `GET /v8/management/observability/archive` is authenticated by the existing v8
 management middleware. The indexer atomically publishes a bounded metadata snapshot
 in `request-archive-stats.json`. The endpoint reports recorder configuration,

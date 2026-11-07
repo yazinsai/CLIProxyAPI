@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
 )
 
@@ -187,5 +188,34 @@ func TestWebsocketTurnsHaveIndependentCompletionRowsAndFinalizeOnce(t *testing.T
 	rows, _, _, _ := store.Snapshot(time.Hour)
 	if len(rows) != 2 || rows[0].Model != "first-model" || rows[1].Model != "second-model" {
 		t.Fatalf("websocket rows %#v", rows)
+	}
+}
+
+func TestStoreSchemaTwoIgnoresFaultyTelemetryAndResetsCoverage(t *testing.T) {
+	directory := t.TempDir()
+	old := testRow(time.Now().UTC().Add(-time.Hour), "model", "provider", "interrupted")
+	old.Reason = "cancelled"
+	doc := ojson.NewDocString("{}")
+	for key, value := range map[string]any{"schema_version": 1, "coverage_start": old.StartedAt, "request": old} {
+		if errSet := doc.Set(key, value); errSet != nil {
+			t.Fatal(errSet)
+		}
+	}
+	if errWrite := os.WriteFile(filepath.Join(directory, "dashboard-completions.jsonl"), append(doc.Bytes(), '\n'), 0600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := NewStore(directory)
+	rows, coverage, partial, _ := store.Snapshot(24 * time.Hour)
+	if len(rows) != 0 || !coverage.After(old.CompletedAt) || !partial || store.degraded {
+		t.Fatalf("migration rows=%d coverage=%v partial=%v degraded=%v", len(rows), coverage, partial, store.degraded)
+	}
+	current := testRow(time.Now().UTC(), "model", "provider", "success")
+	if errAdd := store.Add(current); errAdd != nil {
+		t.Fatal(errAdd)
+	}
+	reloaded := NewStore(directory)
+	rows, afterCoverage, _, _ := reloaded.Snapshot(24 * time.Hour)
+	if len(rows) != 1 || rows[0].ID != current.ID || !afterCoverage.Equal(coverage) {
+		t.Fatalf("reloaded migration rows=%#v coverage=%v", rows, afterCoverage)
 	}
 }
