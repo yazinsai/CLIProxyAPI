@@ -1,6 +1,6 @@
 # Full request archive
 
-The local proxy uses the `feat/request-archive` branch based on v8.0.56.
+The local proxy uses the archive-enabled backend fork based on v8.0.56.
 Set `CLI_PROXY_REQUEST_ARCHIVE=1` in the proxy's environment and enable
 `observability.logs.request-log`. Disable size-based plaintext log cleanup with
 `observability.logs.logs-max-total-size-mb: 0` and error-file cleanup with
@@ -62,9 +62,69 @@ screen. Existing dashboard request-log downloads continue to work. Index scans a
 linear in record count and skip already indexed immutable members. At very large
 volumes, date partitioning or a dedicated archive service would be appropriate.
 
-## Background compaction
+## Background optimization
 
-The `watch` command compacts completed `*.log.zst` files in batches of 100.
+The watcher replaces verified completed records with lossless, content-addressed
+storage. Long raw JSON strings (including inline images and tool output) establish
+stable chunk boundaries, so growing conversation histories and upstream retries
+share their unchanged bytes. Headers, binary data, whitespace, escapes, and every
+response chunk are reconstructed byte for byte; nothing is parsed and rewritten,
+sampled, or omitted. Chunk and complete-record SHA-256 checks detect corruption.
+
+`request-records/` contains immutable compressed JSON manifests. Each manifest
+keeps the original logical `.log.zst` name, completion time, original size, digest,
+and ordered chunk references. `request-chunks/` contains independently compressed
+chunks addressed by their uncompressed SHA-256. Both directories are authoritative
+archive data: back them up together. SQLite remains a rebuildable metadata index.
+Losing a shared chunk affects every record that references it. No automatic
+expiry or garbage collection removes these objects.
+
+Compressed manifests and chunks are also grouped into immutable ZIP_STORED packs
+to avoid small-file allocation overhead. Manifest packs contain only compressed
+manifests; chunk packs are partitioned by the first two digest characters. A
+download opens the requested manifest and chunks directly without expanding other
+records. Deduplication spans packs and does not depend on a 100-record batch.
+
+The measured defaults are a 512-byte minimum string span, 32 KiB ordinary chunks,
+2 MiB maximum string chunks, and Zstandard level 19. Four background compression
+workers prefetch at most eight chunks; publication and verification remain
+serialized. The request-handling recorder still uses one encoder worker.
+The watcher groups 1,000 manifests and 100 chunks per digest shard. Explicit
+`optimize` uses 5,000-member packs and packs partial batches to minimize ZIP
+headers and allocation slack without waiting for new requests.
+
+Optional immutable trained dictionaries improve compression without requiring
+other records to be decompressed. Chunk and manifest dictionaries are selected
+separately because their data differs. The CLI installs supplied dictionaries in
+`request-chunks/dictionaries/<id>.zdict` and publishes active pointers for future
+watcher runs. Each frame carries its dictionary ID, so historical frames remain
+readable after a dictionary change. Dictionaries contain retained data: keep them
+private, include them in backups, and never commit archive-derived dictionaries.
+
+Optimization publishes and syncs chunks, then publishes and syncs the manifest,
+then reconstructs and verifies the complete record before removing its legacy
+source. Every member of an old ZIP pack must have a verified replacement before
+that pack is removed. A restart can finish cleanup after publication; conflicts or
+verification failures retain sources. Temporary files and interrupted spools are
+never optimization candidates.
+
+```sh
+python3.14 tools/request-archive/archive.py --directory /path/to/logs optimize --dry-run
+python3.14 tools/request-archive/archive.py --directory /path/to/logs optimize
+python3.14 tools/request-archive/archive.py --directory /path/to/logs optimize \
+  --dictionary /private/path/chunks.zdict --manifest-dictionary /private/path/manifests.zdict
+```
+
+Deploy the updated Go readers before starting the updated watcher or running
+`optimize`. The local `bun run sync:local` command deploys them in that order.
+Legacy standalone archives and packs remain readable during migration. Old
+backends cannot reconstruct the new format: export records back to their original
+plaintext names and recompress them before rolling back. Keep full archive
+directories, including shared chunks, through upgrades.
+
+### Legacy 100-record compaction
+
+The earlier watcher compacted completed `*.log.zst` files in batches of 100.
 Fewer than 100 standalone records remain untouched until enough accumulate.
 Compaction runs in the indexer process, outside request handling. Plaintext logs,
 active streams, temporary files, and interrupted captures are never candidates.
@@ -94,6 +154,38 @@ measures physical archive storage including ZIP metadata and any recovery duplic
 Deploy the updated backend readers before restarting the updated watcher. An old
 backend cannot read packed records. Keep the updated readers or unpack ZIP members
 back to their original `.log.zst` basenames before rolling back the backend.
+
+## Storage measurements
+
+The 2026-11-07 benchmark verified all 20,105 records in its snapshot against their
+indexed SHA-256: 43,715,041,186 original bytes and 12,666,362,736 compressed record
+bytes. A 748-record tuning sample included every record larger than 10 MiB and
+500 consecutive ordinary exchanges. No retained record was sampled or truncated;
+sampling here describes only which records were used for comparative tuning.
+
+| Strategy | Compressed objects and manifests, before ZIP overhead |
+| --- | ---: |
+| Existing independently compressed records | 12,666,362,736 bytes |
+| Shared strings, 256 KiB ordinary chunks, level 3 | 1,015,166,256 bytes |
+| Shared strings, 32 KiB ordinary chunks, level 19 | 912,016,858 bytes |
+
+The selected configuration reduced payload storage by 92.8% before packing.
+Thresholds below 512 bytes increased manifest references enough to lose their
+deduplication gains. Generic content-defined chunking produced 131.3 MB on the
+tuning sample versus 98.9 MB for string-anchored chunks. Level 22 saved only 3,818
+bytes over level 19 in a 286 MB unique-object test, so level 19 was selected.
+
+Separate 256 KiB dictionaries saved a further 22.3% on held-out unique chunks and
+22.3% on held-out manifests, including dictionary overhead. Dictionaries were
+trained on separate subsets. Applying the chunk dictionary to manifests made them
+larger, which is why the two active dictionaries are separate.
+
+Solid compression of groups of unique objects reduced storage further but
+required decoding 168–792 MB for 50 targeted reads, versus 1.69 MB with independent
+dictionary-compressed chunks. Independent chunks were selected to preserve direct
+downloads and quota-history reads. Immutable dictionary tables are prepared and
+reused at the chosen level; the prepared and unprepared modes produced identical
+bytes on the comparison sample, with prepared compression 3.4 times faster.
 
 ## Local installation
 
@@ -152,13 +244,16 @@ or persistence encountered an error. Coverage survives idle restarts, and bounde
 journal eviction advances the coverage boundary. Request details expose an archive
 download ID only when a matching file or pack entry is present.
 
-Completion journal schema 2 records the consumer's explicit stream-delivery
-acknowledgment before execution cleanup. A validated and flushed terminal success
-remains successful when the consumer intentionally cancels the upstream reader.
+Completion journal schema 3 records terminal delivery independently of whether
+the producer supports early cancellation. A validated and flushed terminal success
+remains successful when the client disconnects before the upstream reader drains.
+Responses, Claude messages, standard Responses websocket turns, and converted
+image streams acknowledge their terminal events; shared HTTP forwarding also
+preserves write and flush errors. HTTP rejection reasons survive later disconnects.
 Disconnects before terminal delivery, write/flush errors, and terminal protocol
 failures remain failed or interrupted. Provider usage success alone never proves
-successful downstream delivery. Schema 1 telemetry from the initial implementation
-is ignored because it incorrectly classified normal terminal cleanup as interrupted;
+successful downstream delivery. Schema 1 and 2 telemetry is ignored because it
+incorrectly classified completed streams and normal terminal cleanup as interrupted;
 the coverage boundary resets when upgrading. Full request archives are unchanged.
 
 `GET /v8/management/observability/archive` is authenticated by the existing v8

@@ -67,3 +67,46 @@ func TestPackedArchiveNameReservationAndReaderLifetime(t *testing.T) {
 		t.Fatalf("missing record: %v", err)
 	}
 }
+
+func TestArchiveLegacyPackSnapshotSurvivesMigrationRemoval(t *testing.T) {
+	dir := t.TempDir()
+	name := "v1-responses-2026-11-05T150000-12345678.log.zst"
+	path := filepath.Join(dir, "requests-retained.zip")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := zip.NewWriter(file)
+	member, err := writer.CreateHeader(&zip.FileHeader{
+		Name: name, Method: zip.Store, Comment: "123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("remaining legacy compressed bytes")
+	if _, err = member.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The first path was present in the directory snapshot, then migrated and
+	// removed before this scan. It must not hide a still-retained later record.
+	paths := []string{filepath.Join(dir, "requests-already-migrated.zip"), path}
+	records := make(map[string]RequestLogFile)
+	if err = addLegacyRequestPacks(paths, records); err != nil || len(records) != 1 {
+		t.Fatalf("legacy snapshot listing: records=%d err=%v", len(records), err)
+	}
+	reader, err := openLegacyPackedRequest(paths, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, errRead := io.ReadAll(reader)
+	errClose := reader.Close()
+	if errRead != nil || errClose != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("legacy snapshot read: read=%v close=%v", errRead, errClose)
+	}
+}

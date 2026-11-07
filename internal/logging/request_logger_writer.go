@@ -480,6 +480,17 @@ func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error
 
 // createUnarchivedLogFile reserves names already used by compressed records.
 func createUnarchivedLogFile(path string) (*os.File, error) {
+	manifestPath := filepath.Join(filepath.Dir(path), requestManifestPath(filepath.Base(path)+".zst"))
+	if _, errManifest := os.Lstat(manifestPath); errManifest == nil {
+		return nil, os.ErrExist
+	} else if !os.IsNotExist(errManifest) {
+		return nil, errManifest
+	}
+	if exists, errDedup := deduplicatedRequestNameExists(filepath.Dir(path), filepath.Base(path)+".zst"); errDedup != nil {
+		return nil, errDedup
+	} else if exists {
+		return nil, os.ErrExist
+	}
 	if _, err := os.Stat(path + ".zst"); err == nil {
 		return nil, os.ErrExist
 	} else if !os.IsNotExist(err) {

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 )
 
@@ -1374,7 +1373,7 @@ func serveRequestLog(c *gin.Context, path, name string) {
 		c.FileAttachment(path, name)
 		return
 	}
-	file, err := logging.OpenRequestArchive(path)
+	file, err := logging.OpenRequestRecord(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
@@ -1384,12 +1383,6 @@ func serveRequestLog(c *gin.Context, path, name string) {
 		return
 	}
 	defer func() { _ = file.Close() }()
-	decoder, err := zstd.NewReader(file, zstd.WithDecoderConcurrency(1))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot decode request archive"})
-		return
-	}
-	defer decoder.Close()
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
-	c.DataFromReader(http.StatusOK, -1, "text/plain; charset=utf-8", decoder, nil)
+	c.DataFromReader(http.StatusOK, -1, "text/plain; charset=utf-8", file, nil)
 }

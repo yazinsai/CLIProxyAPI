@@ -19,6 +19,7 @@ import shutil
 import tempfile
 import sys
 import time
+import archive_dedup as dedup
 
 
 def connect(directory):
@@ -58,7 +59,11 @@ def archive_sources(directory):
     """List immutable members without keeping every pack's file descriptor open."""
     sources = {}
     for pack in sorted(directory.glob('requests-*.zip')):
-        with zipfile.ZipFile(pack) as source:
+        try:
+            source = zipfile.ZipFile(pack)
+        except FileNotFoundError:
+            continue  # A concurrent optimizer may have published manifests.
+        with source:
             for member in source.infolist():
                 if Path(member.filename).name != member.filename or not member.filename.endswith('.log.zst'):
                     raise ValueError('Invalid pack member')
@@ -76,7 +81,27 @@ def archive_sources(directory):
             continue  # Another process may have just packed this record.
         sources[path.name] = (stat.st_mtime_ns, stat.st_size, None,
                               lambda path=path: path.open('rb'))
+    for path, identity in dedup.payload_metadata_locations(directory / 'request-records', dedup.MANIFEST_SUFFIX):
+        name = path.name.removesuffix(dedup.MANIFEST_SUFFIX)
+        manifest = dedup.manifest_metadata(path, name, identity)
+        container = str(path.relative_to(directory))
+        sources[name] = (manifest['modified_ns'], manifest.get('legacy_compressed_bytes', 0),
+                         container, lambda path=path, name=name: dedup.open_record(directory, path, name))
     yield sources
+
+
+def is_deduplicated(container):
+    return container is not None and container.startswith('request-records/')
+
+
+@contextmanager
+def open_source(container, opener):
+    with opener() as source:
+        if is_deduplicated(container):
+            yield source
+        else:
+            with zstd.open(source, 'rb') as decoded:
+                yield decoded
 
 
 @contextmanager
@@ -89,13 +114,12 @@ def open_record(directory, name):
                     continue
                 raise FileNotFoundError(name)
             try:
-                compressed = stack.enter_context(sources[name][3]())
+                source = stack.enter_context(open_source(sources[name][2], sources[name][3]))
             except FileNotFoundError:
                 if attempt == 0:
                     continue
                 raise
-            with zstd.open(compressed, 'rb') as source:
-                yield source
+            yield source
             return
 
 
@@ -123,7 +147,11 @@ def compact(db, directory, batch_size=100):
             for name, (_, _, container, opener) in sources.items():
                 path = directory / name
                 if container and path.exists():
-                    with opener() as packed, path.open('rb') as loose:
+                    with ExitStack() as stack:
+                        packed = stack.enter_context(opener())
+                        loose = stack.enter_context(path.open('rb'))
+                        if is_deduplicated(container):
+                            loose = stack.enter_context(zstd.open(loose, 'rb'))
                         while True:
                             a, b = packed.read(1024 * 1024), loose.read(1024 * 1024)
                             if a != b:
@@ -189,7 +217,7 @@ def compact(db, directory, batch_size=100):
 def index(db, directory):
     added = 0
     failures = []
-    with archive_sources(directory) as sources:
+    with dedup.inventory_snapshot(), archive_sources(directory) as sources:
         for name, (modified_ns, compressed_bytes, container, opener) in sources.items():
             old = db.execute('SELECT modified_ns, compressed_bytes, container FROM records WHERE name=?',
                              (name,)).fetchone()
@@ -200,7 +228,7 @@ def index(db, directory):
             header = b''
             # Read the complete record to validate the frame checksum and hash every byte.
             try:
-                with opener() as compressed, zstd.open(compressed, 'rb') as source:
+                with open_source(container, opener) as source:
                     while chunk := source.read(1024 * 1024):
                         digest.update(chunk)
                         size += len(chunk)
@@ -227,6 +255,116 @@ def index(db, directory):
     return added
 
 
+def optimize(db, directory, chunk_bytes=dedup.DEFAULT_CHUNK_BYTES,
+             string_bytes=dedup.DEFAULT_STRING_BYTES, level=dedup.DEFAULT_LEVEL,
+             max_packs=None, max_loose=None, dry_run=False, progress=None,
+             string_chunk_bytes=dedup.DEFAULT_STRING_CHUNK_BYTES, pack_tails=False,
+             dictionary_path=None, manifest_dictionary_path=None):
+    """Deduplicate legacy files after durable, byte-verified record publication.
+
+    All sources remain authoritative until their replacement is independently
+    verified. A pack is removed only after every member has a verified manifest.
+    Published manifests win listing/read races and support restart recovery.
+    """
+    packs = sorted(directory.glob('requests-*.zip'))
+    loose = sorted(directory.glob('*.log.zst'))
+    if max_packs is not None:
+        packs = packs[:max_packs]
+    if max_loose is not None:
+        loose = loose[:max_loose]
+    if dry_run:
+        return {'packs': len(packs), 'standalone': len(loose),
+                'legacy_bytes': sum(path.stat().st_size for path in packs + loose)}
+    if not 1 <= level <= 22:
+        raise ValueError('Invalid archive compression level')
+    if not 0 < chunk_bytes <= dedup.MAX_CHUNK_BYTES or not 0 < string_chunk_bytes <= dedup.MAX_CHUNK_BYTES or string_bytes < 1:
+        raise ValueError('Invalid archive chunk settings')
+    count = 0
+    last_progress = time.monotonic()
+    updates = []
+    verified_chunks = {}
+    with (directory / '.request-compaction.lock').open('a+b') as lock, dedup.inventory_snapshot():
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        sync_directory(directory)
+        dictionary = dedup.install_dictionary(directory, dictionary_path) if dictionary_path is not None else dedup.active_dictionary(directory)
+        manifest_dictionary = dedup.install_dictionary(directory, manifest_dictionary_path, 'active-manifest-dictionary') if manifest_dictionary_path is not None else dedup.active_dictionary(directory, 'active-manifest-dictionary')
+
+        def heartbeat():
+            nonlocal last_progress
+            now = time.monotonic()
+            if progress is not None and now - last_progress >= 5:
+                progress(count)
+                # Inventory scans can exceed the interval on a large archive.
+                # Wait a full interval after publication before scanning again.
+                last_progress = time.monotonic()
+
+        def convert(name, stamp, compressed_bytes, source):
+            nonlocal count
+            expected = db.execute('SELECT modified_ns, original_bytes, sha256 FROM records WHERE name=?',
+                                  (name,)).fetchone()
+            if expected is None:
+                raise ValueError('Unverified archive; run index first')
+            if expected[0] != stamp:
+                raise ValueError('Archive differs from verified index; retained source')
+            with zstd.open(source, 'rb') as decoded:
+                if expected[1] > dedup.MAX_SEMANTIC_RECORD_BYTES:
+                    dedup.publish_stream_record(directory, name, decoded, stamp, compressed_bytes,
+                                                expected[1], expected[2], chunk_bytes, level,
+                                                verified_chunks, heartbeat, dictionary, manifest_dictionary)
+                else:
+                    data = decoded.read(dedup.MAX_SEMANTIC_RECORD_BYTES + 1)
+                    if (len(data), hashlib.sha256(data).hexdigest()) != expected[1:]:
+                        raise ValueError('Archive differs from verified index; retained source')
+                    dedup.publish_record(directory, name, data, stamp, compressed_bytes,
+                                         chunk_bytes, string_bytes, level, verified_chunks,
+                                         string_chunk_bytes, heartbeat, dictionary, manifest_dictionary)
+            updates.append((str(dedup.manifest_path(directory, name).relative_to(directory)), name))
+            count += 1
+
+        def update_index():
+            # Publication already verified every byte against the existing row.
+            # Avoid decompressing the same records again on every migrated pack.
+            with db:
+                db.executemany('UPDATE records SET container=? WHERE name=?', updates)
+            updates.clear()
+
+        for path in packs:
+            if not path.exists():
+                continue
+            before = path.stat()
+            with zipfile.ZipFile(path) as pack:
+                for member in pack.infolist():
+                    if Path(member.filename).name != member.filename or not member.filename.endswith('.log.zst'):
+                        raise ValueError('Invalid pack member')
+                    with pack.open(member) as source:
+                        convert(member.filename, int(member.comment), member.file_size, source)
+            after = path.stat()
+            if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                raise ValueError('Archive pack changed; retained source')
+            path.unlink()
+            sync_directory(directory)
+            update_index()
+            if progress is not None:
+                progress(count)
+        for path in loose:
+            if not path.exists():
+                continue
+            before = path.stat()
+            with path.open('rb') as source:
+                convert(path.name, before.st_mtime_ns, before.st_size, source)
+            after = path.stat()
+            if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                raise ValueError('Standalone archive changed; retained source')
+            path.unlink()
+            sync_directory(directory)
+        if loose:
+            update_index()
+        if progress is not None:
+            progress(count)
+        packed = dedup.compact_storage(directory, all_tails=pack_tails)
+    return {'optimized': count, **packed}
+
+
 def publish_stats(db, directory, error=None, now=None):
     """Publish bounded metadata atomically; dashboard requests never scan payloads."""
     now = now or datetime.now(timezone.utc)
@@ -238,7 +376,21 @@ def publish_stats(db, directory, error=None, now=None):
         FROM records WHERE modified_ns >= ? GROUP BY 1""",
         (int(datetime.combine(first_day, datetime.min.time(), timezone.utc).timestamp() * 1e9),)).fetchall()
     daily = dict(rows)
-    files = list(directory.glob('*.log.zst')) + list(directory.glob('requests-*.zip'))
+    manifest_root = directory / 'request-records'
+    chunk_root = directory / 'request-chunks'
+    manifests = dedup.payload_paths(manifest_root, dedup.MANIFEST_SUFFIX)
+    chunks = []
+    for shard in chunk_root.glob('*'):
+        if shard.is_dir() and shard.name != 'dictionaries':
+            chunks.extend(dedup.payload_paths(shard, '.zst'))
+    storage = list(manifest_root.glob('*' + dedup.MANIFEST_SUFFIX)) + list(manifest_root.glob('records-*.zip'))
+    storage += list(chunk_root.glob('*/*.zst')) + list(chunk_root.glob('*/chunks-*.zip'))
+    storage += list((chunk_root / 'dictionaries').glob('*.zdict'))
+    for pointer_name in dedup.DICTIONARY_POINTERS:
+        pointer = chunk_root / 'dictionaries' / pointer_name
+        if pointer.is_file():
+            storage.append(pointer)
+    files = list(directory.glob('*.log.zst')) + list(directory.glob('requests-*.zip')) + storage
     with archive_sources(directory) as sources:
         sources = dict(sources)
     disk = shutil.disk_usage(directory)
@@ -254,6 +406,8 @@ def publish_stats(db, directory, error=None, now=None):
         'archive_files': len(sources),
         'storage_files': len(files),
         'pack_files': sum(p.suffix == '.zip' for p in files),
+        'deduplicated_records': len(manifests),
+        'shared_chunks': len(chunks),
         'archived_bytes': sum(p.stat().st_size for p in files),
         'original_bytes': totals[2],
         'index_bytes': index_bytes,
@@ -287,6 +441,19 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('index')
     sub.add_parser('watch')
+    optimization = sub.add_parser('optimize')
+    optimization.add_argument('--dry-run', action='store_true')
+    optimization.add_argument('--chunk-size', type=int, default=dedup.DEFAULT_CHUNK_BYTES,
+                              help='Maximum uncompressed chunk bytes')
+    optimization.add_argument('--string-threshold', type=int, default=dedup.DEFAULT_STRING_BYTES,
+                              help='Minimum raw JSON string bytes to split independently')
+    optimization.add_argument('--string-chunk-size', type=int, default=dedup.DEFAULT_STRING_CHUNK_BYTES,
+                              help='Maximum bytes per chunk inside a long raw JSON string')
+    optimization.add_argument('--level', type=int, default=dedup.DEFAULT_LEVEL)
+    optimization.add_argument('--dictionary', type=Path,
+                              help='Install and activate an immutable trained Zstandard dictionary')
+    optimization.add_argument('--manifest-dictionary', type=Path,
+                              help='Install and activate a separate trained dictionary for manifests')
     search = sub.add_parser('search')
     search.add_argument('--request-id')
     search.add_argument('--url')
@@ -311,7 +478,8 @@ def main():
             while True:
                 try:
                     index(db, directory)
-                    compact(db, directory)
+                    optimize(db, directory, max_packs=1, max_loose=100,
+                             progress=lambda _: publish_stats(db, directory))
                     publish_stats(db, directory)
                 except Exception as error:
                     print(f'Archive indexing failed: {type(error).__name__}; will retry', file=sys.stderr, flush=True)
@@ -324,6 +492,18 @@ def main():
             added = index(db, directory)
             publish_stats(db, directory)
             print(json.dumps({'indexed': added}))
+        elif args.command == 'optimize':
+            if not args.dry_run:
+                index(db, directory)
+            result = optimize(db, directory, args.chunk_size, args.string_threshold, args.level,
+                              dry_run=args.dry_run,
+                              progress=lambda _: publish_stats(db, directory),
+                              string_chunk_bytes=args.string_chunk_size, pack_tails=True,
+                              dictionary_path=args.dictionary,
+                              manifest_dictionary_path=args.manifest_dictionary)
+            if not args.dry_run:
+                publish_stats(db, directory)
+            print(json.dumps(result))
         else:
             index(db, directory)
             db.row_factory = sqlite3.Row

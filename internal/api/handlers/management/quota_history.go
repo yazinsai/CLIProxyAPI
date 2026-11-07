@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -332,7 +331,7 @@ func (cache *quotaHistoryCache) load(dir string, since time.Time) []quotaHistory
 }
 
 func parseQuotaHistoryFile(path string) ([]quotaHistorySample, error) {
-	file, err := logging.OpenRequestArchive(path)
+	file, err := logging.OpenRequestRecord(path)
 	if err != nil {
 		return nil, err
 	}
@@ -341,12 +340,7 @@ func parseQuotaHistoryFile(path string) ([]quotaHistorySample, error) {
 			log.WithError(errClose).Debug("quota history: close archive")
 		}
 	}()
-	decoder, err := zstd.NewReader(file, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
-	if err != nil {
-		return nil, err
-	}
-	defer decoder.Close()
-	return parseQuotaHistoryRecord(decoder)
+	return parseQuotaHistoryRecord(file)
 }
 
 type quotaHistoryAttempt struct {
