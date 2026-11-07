@@ -128,6 +128,30 @@ masking, and archived downloads through `/v8/management/observability/logs/reque
 
 ## Dashboard metadata and upstream updates
 
+The live dashboard also exposes authenticated v8 endpoints under
+`/observability/dashboard`: `/routes`, `/requests`, `/requests/:id`, and `/summary`.
+The request feed and summary share `window=1h|8h|24h`. The feed accepts a bounded
+`limit`, a stable cursor, and `outcome=failed`, which includes interrupted streams.
+Summary groups use the exact requested model ID and the final public provider group.
+Aliases remain distinct IDs. Scheduler route inspection does not advance selection.
+
+Completion metadata is recorded independently of full archives, without bodies,
+headers, credentials, account identities, or raw upstream error text. HTTP model
+requests produce one final inbound row; retry attempts are children. Accepted
+streams with terminal failures remain failures even when the inbound HTTP status
+is 200. Standard Responses websocket turns produce separate completion rows rather
+than one row for the entire socket. Management calls and model-catalog requests are
+excluded. The store does not consume the usage queue or decompress archived bodies.
+
+`dashboard-completions.jsonl` and its `.previous` journal retain at most 64 MiB;
+the live store retains at most 100,000 completions over 24 hours and 16 attempts per
+completion. This metadata is not a lossless audit log. Capture begins when the
+updated server starts; existing full archives are not backfilled. Responses expose
+`coverage_start` and `partial` whenever the requested window is incompletely covered
+or persistence encountered an error. Coverage survives idle restarts, and bounded
+journal eviction advances the coverage boundary. Request details expose an archive
+download ID only when a matching file or pack entry is present.
+
 `GET /v8/management/observability/archive` is authenticated by the existing v8
 management middleware. The indexer atomically publishes a bounded metadata snapshot
 in `request-archive-stats.json`. The endpoint reports recorder configuration,

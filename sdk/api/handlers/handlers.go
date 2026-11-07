@@ -16,7 +16,9 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
@@ -599,6 +601,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 
 	if requestCtx != nil {
 		parentCtx = httptransport.InheritDecorator(parentCtx, requestCtx)
+		parentCtx = dashboard.InheritTracker(parentCtx, requestCtx)
 	}
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
@@ -656,6 +659,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = coreauth.WithCodexClientRequest(newCtx, coreauth.IsCodexClientRequest(newCtx))
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {
+		defer dashboard.CompleteSocket(newCtx, uuid.NewString())
 		if c != nil {
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
 		}

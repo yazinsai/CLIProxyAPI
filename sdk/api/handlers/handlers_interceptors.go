@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -152,6 +153,7 @@ func (t *requestLifecycleTracker) complete(outcome pluginapi.RequestCompletionOu
 		completion.Outcome = outcome
 		completion.StatusCode = statusCode
 		completion.CompletedAt = time.Now()
+		dashboard.ObserveCompletion(t.ctx, completion.RequestedModel, completion.Stream, outcome != pluginapi.RequestCompletionSucceeded, outcome == pluginapi.RequestCompletionCanceled, statusCode)
 		if err != nil {
 			completion.Error = err.Error()
 		}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -46,6 +47,7 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 
 func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	dashboard.ObserveModel(ctx, originalRequestedModel, false)
 	// Speech-only models are reachable solely through the speech entry protocol.
 	execOptions.AllowSpeechModel = isModelExecutionSpeechProtocol(entryProtocol)
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
@@ -132,6 +134,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 
 func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	dashboard.ObserveModel(ctx, originalRequestedModel, false)
 	routeDecision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, false, execOptions)
 	if routeDecision.ExecutorPluginID != "" {
 		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)

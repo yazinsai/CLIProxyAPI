@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
@@ -38,6 +39,7 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
+	dashboardStore          *dashboard.Store
 	cfg                     *config.Config
 	configFilePath          string
 	mu                      sync.Mutex

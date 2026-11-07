@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -30,6 +31,7 @@ func (h *BaseAPIHandler) HasAlternativeExecutionTarget(ctx context.Context, hand
 		return false
 	}
 	originalRequestedModel := modelName
+	dashboard.ObserveModel(ctx, originalRequestedModel, true)
 	execOptions := modelExecutionOptions{
 		AllowSpeechModel: isModelExecutionSpeechProtocol(handlerType),
 	}
@@ -335,6 +337,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	dashboard.ObserveModel(ctx, originalRequestedModel, true)
 	// Speech-only models are reachable solely through the speech entry protocol.
 	execOptions.AllowSpeechModel = isModelExecutionSpeechProtocol(entryProtocol)
 	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)

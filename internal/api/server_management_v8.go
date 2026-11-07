@@ -35,6 +35,10 @@ func (s *Server) registerManagementV8Routes() {
 	v8.POST("/models/refresh", s.mgmt.RefreshModelDefinitions)
 
 	v8.GET("/observability/archive", s.mgmt.GetRequestArchive)
+	v8.GET("/observability/dashboard/routes", s.mgmt.GetDashboardRoutes)
+	v8.GET("/observability/dashboard/requests", s.mgmt.GetDashboardRequests)
+	v8.GET("/observability/dashboard/requests/:id", s.mgmt.GetDashboardRequest)
+	v8.GET("/observability/dashboard/summary", s.mgmt.GetDashboardSummary)
 	v8.GET("/observability/logs", s.mgmt.GetLogs)
 	v8.DELETE("/observability/logs", s.mgmt.DeleteLogs)
 	v8.GET("/observability/logs/errors", s.mgmt.GetRequestErrorLogs)

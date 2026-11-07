@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	log "github.com/sirupsen/logrus"
 )
@@ -755,6 +756,22 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 			record.IsNativeKey = IsNativeAccessProvider(record.AccessProvider)
 		}
 	}
+	outcome := "success"
+	reason := ""
+	status := 200
+	if record.Failed {
+		outcome = "failed"
+		status = record.Fail.StatusCode
+		reason = dashboard.FailureReason(status, record.Fail.Code)
+	}
+	requestedModel := record.Alias
+	if requestedModel == "" {
+		requestedModel = RequestedModelAliasFromContext(ctx)
+	}
+	if requestedModel == "" {
+		requestedModel = record.Model
+	}
+	dashboard.ObserveAttempt(ctx, dashboard.Attempt{ID: record.RequestID, Provider: record.Provider, Model: record.Model, StartedAt: record.RequestedAt.UTC(), CompletedAt: record.RequestedAt.Add(record.Latency).UTC(), StatusCode: status, Outcome: outcome, DurationMS: record.Latency.Milliseconds(), Reason: reason}, record.AuthID, requestedModel, record.Stream)
 	ctx = WithCapturedIdentity(ctx, record.APIKey, record.AccessProvider, record.IsNativeKey)
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())

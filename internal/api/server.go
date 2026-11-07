@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dashboard"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
@@ -172,6 +173,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.CPATraceIDMiddleware())
+	dashboardStore := dashboard.NewStore(logging.ResolveLogDirectory(cfg))
+	engine.Use(middleware.DashboardCompletionMiddleware(dashboardStore, authManager))
 	engine.Use(s.maxRequestBodyBytesMiddleware())
 
 	// Add request logging middleware before recovery and extra middleware so that
@@ -222,6 +225,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applyClaudeToolSearchConfig(cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetDashboardStore(dashboardStore)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
